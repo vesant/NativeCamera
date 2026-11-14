@@ -20,7 +20,8 @@ class NativeCameraPackage : ReactPackage {
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {
         return listOf(
-            CameraEngineViewManager()
+            CameraEngineViewManager(),
+            VideoPlayerViewManager()
         )
     }
 }

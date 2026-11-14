@@ -96,6 +96,29 @@ export interface AstroCaptureResult {
   albumPath: string;
 }
 
+export interface VideoPlayerViewProps extends ViewProps {
+  sourceUri: string;
+  paused?: boolean;
+}
+
+export const NativeVideoPlayerView =
+  requireNativeComponent<VideoPlayerViewProps>('NativeVideoPlayerView');
+
+export interface CapturedMediaItem {
+  id: string;
+  uri: string;
+  thumbnailUri: string;
+  mediaStoreUri: string;
+  isVideo: boolean;
+  modeBadge: string;
+  title: string;
+  subtitle: string;
+  width: number;
+  height: number;
+  durationSec: number;
+  timestampMs: number;
+}
+
 export interface VideoStartResult {
   resolution: string;
   fps: number;
@@ -105,6 +128,8 @@ export interface VideoStartResult {
 
 export interface VideoStopResult {
   videoUri: string;
+  localUri?: string;
+  thumbnailUri?: string;
   resolution: string;
   fps: number;
   bitrateMbps: number;
@@ -141,6 +166,9 @@ interface NativeCameraEngineModuleSpec {
     iso: number,
     evStep: number
   ): Promise<AstroCaptureResult>;
+  getRecentMedia(): Promise<CapturedMediaItem[]>;
+  deleteCapturedMedia(id: string): Promise<boolean>;
+  openMediaExternal(uriString: string, isVideo: boolean): Promise<boolean>;
 }
 
 const CameraEngineNative = NativeModules.CameraEngineModule as
@@ -249,6 +277,30 @@ export async function startComputationalCapture(params: {
   );
 }
 
+export async function getRecentMedia(): Promise<CapturedMediaItem[]> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    return [];
+  }
+  return await CameraEngineNative.getRecentMedia();
+}
+
+export async function deleteCapturedMedia(id: string): Promise<boolean> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    return false;
+  }
+  return await CameraEngineNative.deleteCapturedMedia(id);
+}
+
+export async function openMediaExternal(
+  uriString: string,
+  isVideo: boolean
+): Promise<boolean> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    return false;
+  }
+  return await CameraEngineNative.openMediaExternal(uriString, isVideo);
+}
+
 export function subscribeHistogram(
   listener: (data: CameraHistogramPayload) => void
 ): EmitterSubscription {
@@ -277,6 +329,12 @@ export function subscribeAstroProgress(
   listener: (data: AstroProgressEvent) => void
 ): EmitterSubscription {
   return DeviceEventEmitter.addListener('onAstroProgress', listener);
+}
+
+export function subscribeMediaCaptured(
+  listener: (item: CapturedMediaItem) => void
+): EmitterSubscription {
+  return DeviceEventEmitter.addListener('onMediaCaptured', listener);
 }
 
 /**

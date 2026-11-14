@@ -30,6 +30,7 @@ import {
   subscribeAstroProgress,
   subscribeMotionTelemetry,
 } from '@/native/CameraEngine';
+import { CameraRollPreviewButton } from '@/components/MediaPreviewModal';
 
 const FRAME_COUNT_OPTIONS = [12, 20, 30] as const;
 const EXPOSURE_SEC_OPTIONS = [4, 6, 8, 10] as const;
@@ -265,22 +266,26 @@ export default function AstroModeScreen() {
 
       {/* Main Viewfinder + Progressive Stacking Overlay */}
       <View style={styles.viewfinderBox}>
-        <NativeCameraEngineView
-          style={styles.cameraSurface}
-          cameraId={selectedCameraId}
-          active={isScreenFocused}
-          manualExposure={true}
-          exposureTimeNs={Math.min(250_000_000, effectiveFrameExposureSec * 1_000_000_000)}
-          manualIso={true}
-          isoValue={astroIso}
-          manualFocus={true}
-          focusDistanceDiopters={0.0}
-          manualWhiteBalance={true}
-          wbKelvin={4600}
-          wbTint={0}
-          enableRawDng={false}
-          zoomRatio={1.0}
-        />
+        {isScreenFocused ? (
+          <NativeCameraEngineView
+            style={styles.cameraSurface}
+            cameraId={selectedCameraId}
+            active={isScreenFocused}
+            manualExposure={true}
+            exposureTimeNs={Math.min(250_000_000, effectiveFrameExposureSec * 1_000_000_000)}
+            manualIso={true}
+            isoValue={astroIso}
+            manualFocus={true}
+            focusDistanceDiopters={0.0}
+            manualWhiteBalance={true}
+            wbKelvin={4600}
+            wbTint={0}
+            enableRawDng={false}
+            zoomRatio={1.0}
+          />
+        ) : (
+          <View style={styles.cameraSurface} />
+        )}
 
         {/* Live Progressive Stacked Preview during Multi-Frame Capture */}
         {isCapturingAstro && astroProgress?.previewUri && (
@@ -476,10 +481,17 @@ export default function AstroModeScreen() {
 
         {/* Bottom Astro Shutter & Last Stack Viewer Button */}
         <View style={styles.astroBottomRow}>
-          <View style={styles.leftInfoCol}>
-            <Text style={styles.leftInfoLabel}>PIPELINE</Text>
-            <Text style={styles.leftInfoVal}>C++17 JNI Stack</Text>
-          </View>
+          <Pressable
+            style={[
+              styles.compareBtn,
+              !astroResult && { opacity: 0.45 },
+            ]}
+            disabled={!astroResult}
+            onPress={() => setComparisonModalVisible(true)}
+          >
+            <MaterialCommunityIcons name="compare" size={16} color="#38BDF8" />
+            <Text style={styles.compareBtnText}>Before / After</Text>
+          </Pressable>
 
           <Pressable
             style={[
@@ -508,17 +520,7 @@ export default function AstroModeScreen() {
             </View>
           </Pressable>
 
-          <Pressable
-            style={[
-              styles.compareBtn,
-              !astroResult && { opacity: 0.4 },
-            ]}
-            disabled={!astroResult}
-            onPress={() => setComparisonModalVisible(true)}
-          >
-            <MaterialCommunityIcons name="compare" size={16} color="#38BDF8" />
-            <Text style={styles.compareBtnText}>Before / After</Text>
-          </Pressable>
+          <CameraRollPreviewButton size={50} disabled={isCapturingAstro} />
         </View>
       </View>
 

@@ -1,10 +1,12 @@
 package com.vesant.nativecamera
 
 import android.content.Context
+import android.content.Intent
 import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import android.net.Uri
 import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.LifecycleEventListener
 import com.facebook.react.bridge.Promise
@@ -12,6 +14,8 @@ import com.facebook.react.bridge.ReactApplicationContext
 import com.facebook.react.bridge.ReactContextBaseJavaModule
 import com.facebook.react.bridge.ReactMethod
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import org.json.JSONObject
+import java.io.File
 import kotlin.math.abs
 import kotlin.math.atan2
 import kotlin.math.hypot
@@ -208,6 +212,112 @@ class CameraEngineModule(private val reactContext: ReactApplicationContext) :
             evStep = evStep,
             promise = promise
         )
+    }
+
+    /**
+     * Returns all photos and videos captured by NativeCamera sorted newest-first so the
+     * camera-roll preview thumbnail and full-screen media viewer stay populated across tabs.
+     */
+    @ReactMethod
+    fun getRecentMedia(promise: Promise) {
+        try {
+            val indexDir = File(reactContext.cacheDir, "captured_media")
+            val array = Arguments.createArray()
+            if (!indexDir.exists()) {
+                promise.resolve(array)
+                return
+            }
+
+            val jsonFiles = indexDir.listFiles { file -> file.extension == "json" }
+                ?.sortedByDescending { it.lastModified() }
+                ?.take(40)
+                ?: emptyList()
+
+            for (file in jsonFiles) {
+                try {
+                    val obj = JSONObject(file.readText())
+                    val uriStr = obj.optString("uri", "")
+                    if (uriStr.startsWith("file://")) {
+                        val localPath = uriStr.removePrefix("file://")
+                        if (!File(localPath).exists()) {
+                            file.delete()
+                            continue
+                        }
+                    }
+                    val item = Arguments.createMap().apply {
+                        putString("id", obj.optString("id", file.nameWithoutExtension))
+                        putString("uri", uriStr)
+                        putString("thumbnailUri", obj.optString("thumbnailUri", uriStr))
+                        putString("mediaStoreUri", obj.optString("mediaStoreUri", ""))
+                        putBoolean("isVideo", obj.optBoolean("isVideo", false))
+                        putString("modeBadge", obj.optString("modeBadge", "JPG"))
+                        putString("title", obj.optString("title", "Capture"))
+                        putString("subtitle", obj.optString("subtitle", ""))
+                        putInt("width", obj.optInt("width", 1920))
+                        putInt("height", obj.optInt("height", 1080))
+                        putDouble("durationSec", obj.optDouble("durationSec", 0.0))
+                        putDouble("timestampMs", obj.optDouble("timestampMs", file.lastModified().toDouble()))
+                    }
+                    array.pushMap(item)
+                } catch (_: Throwable) {
+                }
+            }
+            promise.resolve(array)
+        } catch (e: Throwable) {
+            promise.reject("MEDIA_LIST_ERROR", "Failed loading recent captures: ${e.message}", e)
+        }
+    }
+
+    @ReactMethod
+    fun deleteCapturedMedia(id: String, promise: Promise) {
+        try {
+            val indexDir = File(reactContext.cacheDir, "captured_media")
+            val jsonFile = File(indexDir, "$id.json")
+            if (jsonFile.exists()) {
+                try {
+                    val obj = JSONObject(jsonFile.readText())
+                    val uriStr = obj.optString("uri", "")
+                    if (uriStr.startsWith("file://")) {
+                        File(uriStr.removePrefix("file://")).delete()
+                    }
+                    val thumbStr = obj.optString("thumbnailUri", "")
+                    if (thumbStr.startsWith("file://") && thumbStr != uriStr) {
+                        File(thumbStr.removePrefix("file://")).delete()
+                    }
+                    val mediaStoreStr = obj.optString("mediaStoreUri", "")
+                    if (mediaStoreStr.startsWith("content://")) {
+                        try {
+                            reactContext.contentResolver.delete(Uri.parse(mediaStoreStr), null, null)
+                        } catch (_: Throwable) {
+                        }
+                    }
+                } catch (_: Throwable) {
+                }
+                jsonFile.delete()
+            }
+            promise.resolve(true)
+        } catch (e: Throwable) {
+            promise.reject("MEDIA_DELETE_ERROR", "Failed deleting capture: ${e.message}", e)
+        }
+    }
+
+    @ReactMethod
+    fun openMediaExternal(uriString: String, isVideo: Boolean, promise: Promise) {
+        try {
+            if (uriString.isBlank()) {
+                promise.reject("INVALID_URI", "No MediaStore URI available for external viewer.")
+                return
+            }
+            val mime = if (isVideo) "video/mp4" else "image/*"
+            val intent = Intent(Intent.ACTION_VIEW).apply {
+                setDataAndType(Uri.parse(uriString), mime)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            reactContext.startActivity(intent)
+            promise.resolve(true)
+        } catch (e: Throwable) {
+            promise.reject("EXTERNAL_VIEW_ERROR", "Could not open system gallery app: ${e.message}", e)
+        }
     }
 
     @ReactMethod

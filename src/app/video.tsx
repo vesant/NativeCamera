@@ -36,6 +36,7 @@ import {
   VideoStopResult,
 } from '@/native/CameraEngine';
 import { PrecisionSlider } from '@/components/PrecisionSlider';
+import { CameraRollPreviewButton } from '@/components/MediaPreviewModal';
 
 type ControlTab = 'CODEC' | 'SHUTTER' | 'ISO' | 'FOCUS' | 'WB';
 type AspectGuide = 'NONE' | '16:9' | '2.39:1';
@@ -336,22 +337,26 @@ export default function CinemaVideoScreen() {
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       {/* Live Camera2 Viewfinder */}
       <View style={styles.viewfinderContainer}>
-        <NativeCameraEngineView
-          style={styles.cameraSurface}
-          cameraId={selectedCameraId}
-          active={isFocused}
-          manualExposure={manualExposure}
-          exposureTimeNs={exposureTimeNs}
-          manualIso={manualIso}
-          isoValue={isoValue}
-          manualFocus={manualFocus}
-          focusDistanceDiopters={focusDiopters}
-          manualWhiteBalance={manualWb}
-          wbKelvin={wbKelvin}
-          wbTint={wbTint}
-          enableRawDng={false}
-          zoomRatio={1.0}
-        />
+        {isFocused ? (
+          <NativeCameraEngineView
+            style={styles.cameraSurface}
+            cameraId={selectedCameraId}
+            active={isFocused}
+            manualExposure={manualExposure}
+            exposureTimeNs={exposureTimeNs}
+            manualIso={manualIso}
+            isoValue={isoValue}
+            manualFocus={manualFocus}
+            focusDistanceDiopters={focusDiopters}
+            manualWhiteBalance={manualWb}
+            wbKelvin={wbKelvin}
+            wbTint={wbTint}
+            enableRawDng={false}
+            zoomRatio={1.0}
+          />
+        ) : (
+          <View style={styles.cameraSurface} />
+        )}
 
         {/* Cinema Aspect Ratio Letterbox Guides (2.39:1 Anamorphic or 16:9) */}
         {aspectGuide !== 'NONE' && (
@@ -923,11 +928,8 @@ export default function CinemaVideoScreen() {
             />
           </Pressable>
 
-          <View style={styles.metaReadoutRight}>
-            <Text style={styles.metaReadoutLabel}>SHUTTER ANGLE</Text>
-            <Text style={styles.metaReadoutValue}>
-              {shutterAngle180Lock ? '180.0° LOCK' : formatExposureNs(exposureTimeNs)}
-            </Text>
+          <View style={[styles.metaReadoutRight, { alignItems: 'flex-end' }]}>
+            <CameraRollPreviewButton size={52} disabled={isRecording} />
           </View>
         </View>
       </View>

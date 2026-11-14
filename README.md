@@ -61,6 +61,7 @@ Implemented natively in C++17 ([`astro_stacker_jni.cpp`](android/app/src/main/cp
 
 ### Pillar D: Cinema Video Record Mode (`Record` Tab)
 Implemented natively via `CameraDevice.TEMPLATE_RECORD` + `MediaRecorder` in [`CameraEngineView.kt`](android/app/src/main/java/com/vesant/nativecamera/CameraEngineView.kt) and [`src/app/video.tsx`](src/app/video.tsx):
+- **Hardware-Validated Cinema Profiles:** Queries `CamcorderProfile`, `SCALER_STREAM_CONFIGURATION_MAP.getOutputMinFrameDuration`, and `CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES` per physical camera ID, configuring a guaranteed 2-surface (`[SurfaceTexture, MediaRecorder]`) Camera2 session with automatic hardware fallback.
 - **Configurable Cinema Profiles:** Record H.264/AAC `.mp4` streams in `4K UHD` (`3840x2160`), `1080p FHD` (`1920x1080`), or `720p HD` (`1280x720`) at **`24 fps`**, **`30 fps`**, or **`60 fps`** with selectable bitrates (**`24 Mbps`**, **`50 Mbps`**, **`80 Mbps`**).
 - **180° Shutter Angle Cinema Lock:** One-tap lock that sets sensor integration time to $\frac{1}{2 \times \text{fps}}$ (`1/48s` at 24p, `1/60s` at 30p, `1/120s` at 60p) for natural motion cadence.
 - **Live Manual Rack Focus (A/B Focus Pulls) & Exposure While Recording:** Adjust shutter speed, ISO sensitivity, Kelvin white balance, and manual focus in diopters—including programmable **Focus Point A / B** presets—live during an active video recording.
@@ -74,6 +75,13 @@ Implemented natively in [`astro_stacker_jni.cpp`](android/app/src/main/cpp/astro
 2. **Light Trails & Star Trails (Temporal Max-Blend):** Captures continuous long-exposure sequences and blends moving highlights (traffic trails, light painting, star arcs) via temporal maximum (`lighten`) while averaging static dark sky/background regions to suppress read noise.
 3. **Handheld Night Super-Resolution & Multi-Frame Denoise:** Aligns handheld bursts via C++17 RANSAC keypoint registration, crushes high-ISO chroma noise with alpha-trimmed mean stacking, and restores fine edge micro-contrast with a Laplacian unsharp mask.
 4. **Macro Focus Bracketing (Depth-of-Field Fusion):** Automatically steps the lens voice-coil motor in diopters from closest macro focus (`LENS_INFO_MINIMUM_FOCUS_DISTANCE`) to optical infinity (`0.0f` D) and fuses the sharpest focus plane at every pixel using a $3\times 3$ Laplacian energy map.
+
+---
+
+### In-App Camera Roll Thumbnail Well & Photo/Video Lightbox
+Implemented in [`MediaPreviewModal.tsx`](src/components/MediaPreviewModal.tsx) and [`VideoPlayerViewManager.kt`](android/app/src/main/java/com/vesant/nativecamera/VideoPlayerViewManager.kt):
+- **Live Bottom-Corner Thumbnail Well:** Every capture tab (`Pro RAW`, `Record`, `Lab Modes`, `Astro`) includes a live thumbnail button next to the shutter release that updates immediately after capturing a photo, RAW DNG, computational stack, or `.mp4` video (extracting a frame thumbnail via `MediaMetadataRetriever`).
+- **Full-Screen Photo & Native Video Player Modal:** Tapping the thumbnail well opens an in-app media viewer with full-resolution photo inspection, native looping `.mp4` video playback with audio and tap-to-pause/play (`NativeVideoPlayerView`), a horizontal session filmstrip, capture metadata badges, delete support, and a one-tap **Open in Gallery** action.
 
 ---
 

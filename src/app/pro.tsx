@@ -33,6 +33,7 @@ import {
   subscribeTelemetry,
 } from '@/native/CameraEngine';
 import { PrecisionSlider } from '@/components/PrecisionSlider';
+import { CameraRollPreviewButton } from '@/components/MediaPreviewModal';
 
 type ActiveControlTab = 'SHUTTER' | 'ISO' | 'FOCUS' | 'WB';
 type GridOverlayMode = 'THIRDS' | 'GOLDEN' | 'OFF';
@@ -328,22 +329,26 @@ export default function ProModeScreen() {
 
       {/* Live Native Camera2 Viewfinder Surface */}
       <View style={styles.viewfinderContainer}>
-        <NativeCameraEngineView
-          style={styles.cameraSurface}
-          cameraId={selectedCameraId}
-          active={isScreenFocused}
-          manualExposure={manualExposure}
-          exposureTimeNs={exposureTimeNs}
-          manualIso={manualIso}
-          isoValue={isoValue}
-          manualFocus={manualFocus}
-          focusDistanceDiopters={focusDiopters}
-          manualWhiteBalance={manualWb}
-          wbKelvin={wbKelvin}
-          wbTint={wbTint}
-          enableRawDng={enableRawDng}
-          zoomRatio={1.0}
-        />
+        {isScreenFocused ? (
+          <NativeCameraEngineView
+            style={styles.cameraSurface}
+            cameraId={selectedCameraId}
+            active={isScreenFocused}
+            manualExposure={manualExposure}
+            exposureTimeNs={exposureTimeNs}
+            manualIso={manualIso}
+            isoValue={isoValue}
+            manualFocus={manualFocus}
+            focusDistanceDiopters={focusDiopters}
+            manualWhiteBalance={manualWb}
+            wbKelvin={wbKelvin}
+            wbTint={wbTint}
+            enableRawDng={enableRawDng}
+            zoomRatio={1.0}
+          />
+        ) : (
+          <View style={styles.cameraSurface} />
+        )}
 
         {/* Rule-of-Thirds or Golden Ratio Grid Overlay */}
         {gridMode !== 'OFF' && (
@@ -785,11 +790,8 @@ export default function ProModeScreen() {
             </View>
           </Pressable>
 
-          <View style={styles.formatReadoutBox}>
-            <Text style={styles.formatReadoutTop}>OUTPUT</Text>
-            <Text style={styles.formatReadoutBottom}>
-              {enableRawDng && activeSensor?.supportsRaw ? 'DNG + JPG' : 'JPEG 98%'}
-            </Text>
+          <View style={[styles.formatReadoutBox, { alignItems: 'flex-end' }]}>
+            <CameraRollPreviewButton size={52} disabled={isCapturing} />
           </View>
         </View>
       </View>

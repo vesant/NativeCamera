@@ -27,6 +27,7 @@ import {
   startComputationalCapture,
   subscribeAstroProgress,
 } from '@/native/CameraEngine';
+import { CameraRollPreviewButton } from '@/components/MediaPreviewModal';
 
 interface ComputationalModeSpec {
   modeCode: 1 | 2 | 3 | 4;
@@ -257,24 +258,28 @@ export default function ComputationalModesScreen() {
     <SafeAreaView style={styles.safeArea} edges={['top']}>
       {/* Live Camera2 Viewfinder + Progressive Synthesis Overlay */}
       <View style={styles.viewfinderWrap}>
-        <NativeCameraEngineView
-          style={styles.cameraSurface}
-          cameraId={selectedCameraId}
-          active={isFocused}
-          manualExposure={baseExposureSec > 0}
-          exposureTimeNs={
-            baseExposureSec > 0 ? Math.round(baseExposureSec * 1_000_000_000) : 20_000_000
-          }
-          manualIso={true}
-          isoValue={iso}
-          manualFocus={false}
-          focusDistanceDiopters={0.0}
-          manualWhiteBalance={false}
-          wbKelvin={5500}
-          wbTint={0}
-          enableRawDng={false}
-          zoomRatio={1.0}
-        />
+        {isFocused ? (
+          <NativeCameraEngineView
+            style={styles.cameraSurface}
+            cameraId={selectedCameraId}
+            active={isFocused}
+            manualExposure={baseExposureSec > 0}
+            exposureTimeNs={
+              baseExposureSec > 0 ? Math.round(baseExposureSec * 1_000_000_000) : 20_000_000
+            }
+            manualIso={true}
+            isoValue={iso}
+            manualFocus={false}
+            focusDistanceDiopters={0.0}
+            manualWhiteBalance={false}
+            wbKelvin={5500}
+            wbTint={0}
+            enableRawDng={false}
+            zoomRatio={1.0}
+          />
+        ) : (
+          <View style={styles.cameraSurface} />
+        )}
 
         {/* Progressive C++17 Preview while stacking */}
         {isCapturing && progress?.previewUri ? (
@@ -601,28 +606,32 @@ export default function ComputationalModesScreen() {
             ))}
           </ScrollView>
 
-          <Pressable
-            onPress={handleTriggerCapture}
-            style={[
-              styles.synthShutterOuter,
-              { borderColor: activeMode.accent },
-              isCapturing && { borderColor: '#EF4444' },
-            ]}
-          >
-            <View
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 10 }}>
+            <Pressable
+              onPress={handleTriggerCapture}
               style={[
-                styles.synthShutterInner,
-                { backgroundColor: activeMode.accent },
-                isCapturing && styles.synthShutterInnerStop,
+                styles.synthShutterOuter,
+                { borderColor: activeMode.accent },
+                isCapturing && { borderColor: '#EF4444' },
               ]}
             >
-              <Ionicons
-                name={isCapturing ? 'stop' : activeMode.icon}
-                size={22}
-                color="#070A10"
-              />
-            </View>
-          </Pressable>
+              <View
+                style={[
+                  styles.synthShutterInner,
+                  { backgroundColor: activeMode.accent },
+                  isCapturing && styles.synthShutterInnerStop,
+                ]}
+              >
+                <Ionicons
+                  name={isCapturing ? 'stop' : activeMode.icon}
+                  size={22}
+                  color="#070A10"
+                />
+              </View>
+            </Pressable>
+
+            <CameraRollPreviewButton size={48} disabled={isCapturing} />
+          </View>
         </View>
       </View>
 

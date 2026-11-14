@@ -24,8 +24,10 @@ import android.hardware.camera2.DngCreator
 import android.hardware.camera2.TotalCaptureResult
 import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
+import android.media.CamcorderProfile
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaMetadataRetriever
 import android.media.MediaRecorder
 import android.os.Build
 import android.os.Environment
@@ -44,6 +46,7 @@ import com.facebook.react.bridge.Arguments
 import com.facebook.react.bridge.Promise
 import com.facebook.react.bridge.ReactContext
 import com.facebook.react.modules.core.DeviceEventManagerModule
+import org.json.JSONObject
 import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
@@ -62,37 +65,56 @@ import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
 /**
- * Native Camera2 viewfinder and capture surface used by both Pro Mode and Astro Mode.
+ * Native Camera2 viewfinder and capture surface used by Pro Mode, Cinema Record Mode,
+ * Computational Lab Modes, and Astro Mode.
  *
  * Why a custom TextureView instead of a high-level wrapper?
  * High-level camera libraries abstract away per-frame CaptureRequest controls. Here we talk
  * directly to CameraDevice and CameraCaptureSession so we can lock exposure in nanoseconds,
  * set exact ISO analog/digital gain, drive the lens voice-coil motor in raw diopters (0.0f = ∞),
  * compute custom RGGB white-balance channel gains, stream real-time YUV_420_888 histograms,
- * and write uncompressed 16-bit Bayer DNG files via Android's DngCreator.
+ * record high-bitrate H.264/AAC cinema video, and write 16-bit Bayer DNG files via DngCreator.
  */
 class CameraEngineView(context: Context) : FrameLayout(context), TextureView.SurfaceTextureListener {
 
     companion object {
         private const val TAG = "CameraEngineView"
 
-        // Only one CameraDevice can hold a physical sensor at a time. When switching tabs
-        // between Pro Mode and Astro Mode, this lock ensures the outgoing tab's session closes
-        // before the incoming tab opens the camera.
+        // Only one CameraDevice can hold a physical sensor at a time. All CameraEngineView
+        // instances across Expo Router tabs share a single dedicated HandlerThread so outgoing
+        // tab sessions always close completely before incoming tab sessions open the camera.
         private val cameraOpenCloseLock = Semaphore(1)
+        private val threadLock = Any()
+        private var sharedCameraThread: HandlerThread? = null
+        private var sharedCameraHandler: Handler? = null
+        private var currentCameraOwner: CameraEngineView? = null
 
         @Volatile
         var activeInstance: CameraEngineView? = null
+
+        fun getOrStartSharedHandler(): Handler {
+            synchronized(threadLock) {
+                val existing = sharedCameraHandler
+                if (existing != null && sharedCameraThread?.isAlive == true) {
+                    return existing
+                }
+                val thread = HandlerThread("NativeCamera2SharedEngine").also { it.start() }
+                val handler = Handler(thread.looper)
+                sharedCameraThread = thread
+                sharedCameraHandler = handler
+                return handler
+            }
+        }
     }
 
     private val textureView: TextureView = TextureView(context)
-    private var cameraThread: HandlerThread? = null
-    private var cameraHandler: Handler? = null
+    private var cameraHandler: Handler? = getOrStartSharedHandler()
 
     private var cameraDevice: CameraDevice? = null
     private var captureSession: CameraCaptureSession? = null
     private var activeCharacteristics: CameraCharacteristics? = null
     private var previewSize: Size = Size(1920, 1080)
+    private var activeVideoPreviewSize: Size = Size(1920, 1080)
 
     private var yuvReader: ImageReader? = null
     private var jpegReader: ImageReader? = null
@@ -199,16 +221,17 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
 
     override fun onAttachedToWindow() {
         super.onAttachedToWindow()
-        activeInstance = this
         startBackgroundThread()
-        if (isViewActive && textureView.isAvailable) {
-            openCameraInternal(textureView.width, textureView.height)
+        if (isViewActive) {
+            activeInstance = this
+            if (textureView.isAvailable) {
+                openCameraInternal(textureView.width, textureView.height)
+            }
         }
     }
 
     override fun onDetachedFromWindow() {
         closeCameraInternal()
-        stopBackgroundThread()
         if (activeInstance === this) {
             activeInstance = null
         }
@@ -246,20 +269,11 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
     override fun onSurfaceTextureUpdated(surface: SurfaceTexture) = Unit
 
     private fun startBackgroundThread() {
-        if (cameraThread != null) return
-        val thread = HandlerThread("NativeCamera2Engine").also { it.start() }
-        cameraThread = thread
-        cameraHandler = Handler(thread.looper)
+        cameraHandler = getOrStartSharedHandler()
     }
 
     private fun stopBackgroundThread() {
-        cameraThread?.quitSafely()
-        try {
-            cameraThread?.join(800)
-        } catch (_: InterruptedException) {
-        }
-        cameraThread = null
-        cameraHandler = null
+        // Shared background thread remains alive across tab switches
     }
 
     fun startCameraWhenReady() {
@@ -271,7 +285,7 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
     }
 
     fun restartCameraSession() {
-        val handler = cameraHandler ?: return
+        val handler = getOrStartSharedHandler()
         handler.post {
             closeCameraOnCurrentThread()
             if (isViewActive && textureView.isAvailable) {
@@ -281,23 +295,92 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
     }
 
     fun applyManualParametersUpdate() {
-        val handler = cameraHandler ?: return
+        val handler = getOrStartSharedHandler()
         handler.post {
             updateRepeatingPreviewRequest()
         }
     }
 
     private fun openCameraInternal(viewWidth: Int, viewHeight: Int) {
-        startBackgroundThread()
-        val handler = cameraHandler ?: return
+        val handler = getOrStartSharedHandler()
+        cameraHandler = handler
         handler.post {
             openCameraOnCurrentThread(viewWidth, viewHeight)
         }
     }
 
+    private fun setupStillImageReaders(chars: CameraCharacteristics) {
+        val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+
+        // 1. Live YUV_420_888 stream for low-overhead real-time RGB/Luma histogram analysis
+        val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
+        val histSize = yuvSizes
+            .filter { it.width <= 640 && it.height <= 480 }
+            .maxByOrNull { it.width * it.height }
+            ?: yuvSizes.minByOrNull { it.width * it.height }
+            ?: Size(320, 240)
+
+        yuvReader?.close()
+        yuvReader = ImageReader.newInstance(histSize.width, histSize.height, ImageFormat.YUV_420_888, 2).apply {
+            setOnImageAvailableListener({ reader ->
+                val image = try {
+                    reader.acquireLatestImage()
+                } catch (_: Throwable) {
+                    null
+                } ?: return@setOnImageAvailableListener
+
+                try {
+                    val now = System.currentTimeMillis()
+                    if (now - lastHistogramTimestampMs >= 180L && !isAstroBurstRunning && !isRecordingVideo) {
+                        lastHistogramTimestampMs = now
+                        computeAndEmitHistogram(image)
+                    }
+                } finally {
+                    image.close()
+                }
+            }, cameraHandler)
+        }
+
+        // 2. Full-resolution JPEG ImageReader for Pro Mode & Astro burst frames
+        val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
+        val maxJpegSize = jpegSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            ?: Size(1920, 1080)
+
+        jpegReader?.close()
+        jpegReader = ImageReader.newInstance(maxJpegSize.width, maxJpegSize.height, ImageFormat.JPEG, 3)
+
+        // 3. Optional 16-bit Bayer RAW_SENSOR ImageReader for Adobe DNG creation
+        rawReader?.close()
+        rawReader = null
+        rawSurfaceConfigured = false
+        val supportsRawStream = map?.outputFormats?.contains(ImageFormat.RAW_SENSOR) == true
+        if (enableRawDng && supportsRawStream) {
+            val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR) ?: emptyArray()
+            val maxRawSize = rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+            if (maxRawSize != null) {
+                rawReader = ImageReader.newInstance(
+                    maxRawSize.width,
+                    maxRawSize.height,
+                    ImageFormat.RAW_SENSOR,
+                    2
+                )
+            }
+        }
+    }
+
     @SuppressLint("MissingPermission")
     private fun openCameraOnCurrentThread(viewWidth: Int, viewHeight: Int) {
-        if (!isViewActive || cameraDevice != null) return
+        if (!isViewActive) return
+
+        // If another tab's CameraEngineView still holds the physical sensor, close it cleanly first
+        if (currentCameraOwner != null && currentCameraOwner !== this) {
+            currentCameraOwner?.closeCameraOnCurrentThread()
+        }
+        if (cameraDevice != null) return
+
+        currentCameraOwner = this
+        activeInstance = this
+
         val manager = context.getSystemService(Context.CAMERA_SERVICE) as CameraManager
 
         try {
@@ -320,70 +403,22 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
 
             val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
             val previewCandidates = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
-            previewSize = chooseOptimalPreviewSize(previewCandidates, 1920, 1440)
+            // Camera2's guaranteed stream tables cap PREVIEW surfaces to <= 1920x1080
+            previewSize = chooseOptimalPreviewSize(previewCandidates, 1920, 1080)
 
             post {
                 configureTextureTransform(viewWidth, viewHeight)
             }
 
-            // 1. Live YUV_420_888 stream for low-overhead real-time RGB/Luma histogram analysis
-            val yuvSizes = map?.getOutputSizes(ImageFormat.YUV_420_888) ?: emptyArray()
-            val histSize = yuvSizes
-                .filter { it.width <= 640 && it.height <= 480 }
-                .maxByOrNull { it.width * it.height }
-                ?: yuvSizes.minByOrNull { it.width * it.height }
-                ?: Size(320, 240)
-
-            yuvReader?.close()
-            yuvReader = ImageReader.newInstance(histSize.width, histSize.height, ImageFormat.YUV_420_888, 2).apply {
-                setOnImageAvailableListener({ reader ->
-                    val image = try {
-                        reader.acquireLatestImage()
-                    } catch (_: Throwable) {
-                        null
-                    } ?: return@setOnImageAvailableListener
-
-                    try {
-                        val now = System.currentTimeMillis()
-                        if (now - lastHistogramTimestampMs >= 180L && !isAstroBurstRunning) {
-                            lastHistogramTimestampMs = now
-                            computeAndEmitHistogram(image)
-                        }
-                    } finally {
-                        image.close()
-                    }
-                }, cameraHandler)
-            }
-
-            // 2. Full-resolution JPEG ImageReader for Pro Mode & Astro burst frames
-            val jpegSizes = map?.getOutputSizes(ImageFormat.JPEG) ?: emptyArray()
-            val maxJpegSize = jpegSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                ?: Size(1920, 1080)
-
-            jpegReader?.close()
-            jpegReader = ImageReader.newInstance(maxJpegSize.width, maxJpegSize.height, ImageFormat.JPEG, 3)
-
-            // 3. Optional 16-bit Bayer RAW_SENSOR ImageReader for Adobe DNG creation
-            rawReader?.close()
-            rawReader = null
-            rawSurfaceConfigured = false
-            val supportsRawStream = map?.outputFormats?.contains(ImageFormat.RAW_SENSOR) == true
-            if (enableRawDng && supportsRawStream) {
-                val rawSizes = map?.getOutputSizes(ImageFormat.RAW_SENSOR) ?: emptyArray()
-                val maxRawSize = rawSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                if (maxRawSize != null) {
-                    rawReader = ImageReader.newInstance(
-                        maxRawSize.width,
-                        maxRawSize.height,
-                        ImageFormat.RAW_SENSOR,
-                        2
-                    )
-                }
-            }
+            setupStillImageReaders(chars)
 
             manager.openCamera(targetId, object : CameraDevice.StateCallback() {
                 override fun onOpened(device: CameraDevice) {
                     cameraOpenCloseLock.release()
+                    if (!isViewActive) {
+                        device.close()
+                        return
+                    }
                     cameraDevice = device
                     createPreviewSession(allowRawSurface = true)
                 }
@@ -403,22 +438,33 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
             }, cameraHandler)
 
         } catch (e: Throwable) {
-            cameraOpenCloseLock.release()
+            if (cameraOpenCloseLock.availablePermits() == 0) {
+                cameraOpenCloseLock.release()
+            }
             Log.e(TAG, "Failed to open camera $cameraIdProp", e)
             emitStatusEvent("error", "Failed to open camera $cameraIdProp: ${e.message}")
         }
     }
 
-    private fun createPreviewSession(allowRawSurface: Boolean) {
+    private fun createPreviewSession(allowRawSurface: Boolean, includeYuvHistogram: Boolean = true) {
         val device = cameraDevice ?: return
         val texture = textureView.surfaceTexture ?: return
 
         try {
+            if (jpegReader == null || (includeYuvHistogram && yuvReader == null)) {
+                activeCharacteristics?.let { setupStillImageReaders(it) }
+            }
+
             texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+            post {
+                configureTextureTransform(textureView.width, textureView.height)
+            }
             val previewSurface = Surface(texture)
 
             val surfaces = mutableListOf<Surface>(previewSurface)
-            yuvReader?.surface?.let { surfaces.add(it) }
+            if (includeYuvHistogram) {
+                yuvReader?.surface?.let { surfaces.add(it) }
+            }
             jpegReader?.surface?.let { surfaces.add(it) }
             if (allowRawSurface && rawReader?.surface != null) {
                 surfaces.add(rawReader!!.surface)
@@ -442,12 +488,12 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
                     }
 
                     override fun onConfigureFailed(session: CameraCaptureSession) {
-                        // Some HALs reject 4 simultaneous streams (Preview + YUV + JPEG + RAW).
-                        // If RAW caused a stream-combination limit failure, retry without RAW
-                        // so the viewfinder still works reliably.
                         if (allowRawSurface && rawReader != null) {
                             Log.w(TAG, "4-stream RAW session rejected by HAL; retrying without RAW.")
-                            createPreviewSession(allowRawSurface = false)
+                            createPreviewSession(allowRawSurface = false, includeYuvHistogram = includeYuvHistogram)
+                        } else if (includeYuvHistogram) {
+                            Log.w(TAG, "3-stream YUV session rejected by HAL; retrying with Preview+JPEG only.")
+                            createPreviewSession(allowRawSurface = false, includeYuvHistogram = false)
                         } else {
                             emitStatusEvent("error", "Camera2 session configuration failed.")
                         }
@@ -460,13 +506,31 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
         }
     }
 
+    private fun selectHardwareFpsRange(chars: CameraCharacteristics?, desiredFps: Int): Range<Int>? {
+        val ranges = chars?.get(CameraCharacteristics.CONTROL_AE_AVAILABLE_TARGET_FPS_RANGES)
+            ?: return null
+        if (ranges.isEmpty()) return null
+
+        // Prefer an exact fixed range [desiredFps, desiredFps] if the sensor HAL lists it
+        val exactFixed = ranges.firstOrNull { it.lower == desiredFps && it.upper == desiredFps }
+        if (exactFixed != null) return exactFixed
+
+        // Next prefer a range whose upper bound equals desiredFps with highest lower bound
+        val matchingUpper = ranges.filter { it.upper == desiredFps }.maxByOrNull { it.lower }
+        if (matchingUpper != null) return matchingUpper
+
+        // Otherwise pick the range whose upper bound is closest to desiredFps
+        return ranges.minByOrNull { abs(it.upper - desiredFps) * 100 + abs(it.lower - desiredFps) }
+    }
+
     private fun updateRepeatingPreviewRequest() {
         val device = cameraDevice ?: return
         val session = captureSession ?: return
         val texture = textureView.surfaceTexture ?: return
 
         try {
-            val template = if (isRecordingVideo && mediaRecorder != null) {
+            val recordingActive = isRecordingVideo && mediaRecorder != null
+            val template = if (recordingActive) {
                 CameraDevice.TEMPLATE_RECORD
             } else {
                 CameraDevice.TEMPLATE_PREVIEW
@@ -474,23 +538,29 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
             val builder = device.createCaptureRequest(template)
             val previewSurface = Surface(texture)
             builder.addTarget(previewSurface)
-            yuvReader?.surface?.let { builder.addTarget(it) }
 
-            if (isRecordingVideo && mediaRecorder != null) {
+            if (recordingActive) {
                 try {
                     builder.addTarget(mediaRecorder!!.surface)
-                    builder.set(
-                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
-                        Range(videoTargetFps, videoTargetFps)
-                    )
-                    if (videoStabilizationEnabled) {
-                        builder.set(
-                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
-                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
-                        )
+                    selectHardwareFpsRange(activeCharacteristics, videoTargetFps)?.let { fpsRange ->
+                        builder.set(CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE, fpsRange)
                     }
-                } catch (_: Throwable) {
+                    if (videoStabilizationEnabled) {
+                        val stabModes = activeCharacteristics?.get(
+                            CameraCharacteristics.CONTROL_AVAILABLE_VIDEO_STABILIZATION_MODES
+                        ) ?: IntArray(0)
+                        if (stabModes.contains(CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON)) {
+                            builder.set(
+                                CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                                CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                            )
+                        }
+                    }
+                } catch (e: Throwable) {
+                    Log.w(TAG, "Video repeating request setup warning: ${e.message}")
                 }
+            } else {
+                yuvReader?.surface?.let { builder.addTarget(it) }
             }
 
             applyManualControlsToBuilder(builder, isStillCapture = false)
@@ -657,6 +727,7 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
             val wantRaw = enableRawDng && rawSurfaceConfigured && rawReader != null
 
             var savedJpegUri: String? = null
+            var localJpegUri: String? = null
             var savedDngUri: String? = null
             var capturedResult: TotalCaptureResult? = null
             var capturedRawImage: Image? = null
@@ -692,15 +763,31 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
                     isCapturingStill = false
                     updateRepeatingPreviewRequest()
 
+                    val expNs = capturedResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureTimeNs
+                    val iso = capturedResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: isoValue
+                    val shutterStr = formatShutterSpeedNs(expNs)
+                    val primaryUri = localJpegUri ?: savedJpegUri ?: ""
+
+                    if (primaryUri.isNotEmpty()) {
+                        registerAndEmitCapturedMedia(
+                            id = "PRO_$timestamp",
+                            uri = primaryUri,
+                            mediaStoreUri = savedJpegUri ?: "",
+                            thumbnailUri = primaryUri,
+                            isVideo = false,
+                            modeBadge = if (savedDngUri != null) "RAW+JPG" else "PRO JPG",
+                            title = "IMG_${timestamp}_PRO.jpg",
+                            subtitle = "$shutterStr • ISO $iso" + if (savedDngUri != null) " • 16-Bit DNG" else ""
+                        )
+                    }
+
                     val map = Arguments.createMap().apply {
-                        putString("jpegUri", savedJpegUri ?: "")
+                        putString("jpegUri", primaryUri)
                         putString("dngUri", savedDngUri)
                         putBoolean("savedDng", savedDngUri != null)
                         putString("albumPath", "DCIM/NativeCamera")
                         putString("timestamp", timestamp)
-                        val expNs = capturedResult?.get(CaptureResult.SENSOR_EXPOSURE_TIME) ?: exposureTimeNs
-                        val iso = capturedResult?.get(CaptureResult.SENSOR_SENSITIVITY) ?: isoValue
-                        putString("shutterFormatted", formatShutterSpeedNs(expNs))
+                        putString("shutterFormatted", shutterStr)
                         putInt("iso", iso)
                     }
                     promise.resolve(map)
@@ -713,6 +800,12 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
                     val buffer = image.planes[0].buffer
                     val bytes = ByteArray(buffer.remaining())
                     buffer.get(bytes)
+
+                    val mediaDir = File(context.cacheDir, "captured_media").apply { mkdirs() }
+                    val localFile = File(mediaDir, "IMG_${timestamp}_PRO.jpg")
+                    FileOutputStream(localFile).use { it.write(bytes) }
+                    localJpegUri = "file://${localFile.absolutePath}"
+
                     savedJpegUri = saveBytesToMediaStore(
                         bytes = bytes,
                         displayName = "IMG_${timestamp}_PRO.jpg",
@@ -886,19 +979,32 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
 
                     val finalCacheFile = File(tempDir, "astro_final_${timestamp}.jpg")
                     FileOutputStream(finalCacheFile).use { it.write(finalBytes) }
+                    val localStackedUri = "file://${finalCacheFile.absolutePath}"
+
+                    val totalIntegration = ((actualPerFrameSec * capturedFrames) * 10.0).roundToInt() / 10.0
+                    registerAndEmitCapturedMedia(
+                        id = "ASTRO_$timestamp",
+                        uri = localStackedUri,
+                        mediaStoreUri = savedMediaUri ?: "",
+                        thumbnailUri = localStackedUri,
+                        isVideo = false,
+                        modeBadge = "ASTRO ${capturedFrames}F",
+                        title = "ASTRO_${timestamp}_${capturedFrames}F.jpg",
+                        subtitle = "${capturedFrames} frames (${totalIntegration}s) • ISO $clampedIso"
+                    )
 
                     AstroStackerNative.resetSession()
                     isAstroBurstRunning = false
                     updateRepeatingPreviewRequest()
 
                     val response = Arguments.createMap().apply {
-                        putString("stackedUri", "file://${finalCacheFile.absolutePath}")
+                        putString("stackedUri", localStackedUri)
                         putString("mediaStoreUri", savedMediaUri ?: "")
                         putString("singleFrameUri", firstFrameFile?.let { "file://${it.absolutePath}" } ?: "")
                         putInt("framesStacked", capturedFrames)
                         putInt("totalRequestedFrames", totalFrames)
                         putDouble("perFrameExposureSec", (actualPerFrameSec * 100.0).roundToInt() / 100.0)
-                        putDouble("totalIntegrationSec", ((actualPerFrameSec * capturedFrames) * 10.0).roundToInt() / 10.0)
+                        putDouble("totalIntegrationSec", totalIntegration)
                         putInt("iso", clampedIso)
                         putBoolean("abortedEarlyByMotion", abortedByMotion)
                         putString("alignmentReportJson", stackStatsJson)
@@ -1343,117 +1449,240 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
         }
 
         handler.post {
-            val device = cameraDevice
-            val chars = activeCharacteristics
-            val texture = textureView.surfaceTexture
-            if (device == null || chars == null || texture == null) {
-                promise.reject("VIDEO_NOT_READY", "Camera2 device is not open.")
-                return@post
-            }
-            if (isRecordingVideo) {
-                promise.reject("VIDEO_BUSY", "Video recording is already active.")
-                return@post
-            }
+            startVideoRecordingInternal(
+                resolutionPreset = resolutionPreset,
+                fps = fps,
+                bitrateMbps = bitrateMbps,
+                enableAudio = enableAudio,
+                enableStabilization = enableStabilization,
+                useSafeFallback = false,
+                promise = promise
+            )
+        }
+    }
 
+    private fun startVideoRecordingInternal(
+        resolutionPreset: String,
+        fps: Int,
+        bitrateMbps: Int,
+        enableAudio: Boolean,
+        enableStabilization: Boolean,
+        useSafeFallback: Boolean,
+        promise: Promise
+    ) {
+        val device = cameraDevice
+        val chars = activeCharacteristics
+        val texture = textureView.surfaceTexture
+        if (device == null || chars == null || texture == null) {
+            promise.reject("VIDEO_NOT_READY", "Camera2 device is not open.")
+            return
+        }
+        if (isRecordingVideo) {
+            promise.reject("VIDEO_BUSY", "Video recording is already active.")
+            return
+        }
+
+        try {
+            // Release all existing capture sessions and still/YUV ImageReaders first.
+            // Many Snapdragon / MediaTek Camera2 HALs reject MediaRecorder sessions if
+            // RAW_SENSOR, high-res JPEG, or 3rd YUV_420_888 surfaces remain allocated.
             try {
-                try {
-                    captureSession?.stopRepeating()
-                    captureSession?.close()
-                } catch (_: Throwable) {
-                }
-                captureSession = null
+                captureSession?.stopRepeating()
+            } catch (_: Throwable) {
+            }
+            try {
+                captureSession?.close()
+            } catch (_: Throwable) {
+            }
+            captureSession = null
 
-                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
-                val videoSizes = map?.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
-                val desiredWidth = when (resolutionPreset.uppercase(Locale.US)) {
-                    "4K", "UHD", "2160P" -> 3840
-                    "720P", "HD" -> 1280
-                    else -> 1920
-                }
-                val desiredHeight = when (resolutionPreset.uppercase(Locale.US)) {
-                    "4K", "UHD", "2160P" -> 2160
-                    "720P", "HD" -> 720
-                    else -> 1080
-                }
+            yuvReader?.close()
+            yuvReader = null
+            jpegReader?.close()
+            jpegReader = null
+            rawReader?.close()
+            rawReader = null
+            rawSurfaceConfigured = false
 
-                val chosenVideoSize = videoSizes.firstOrNull {
-                    it.width == desiredWidth && it.height == desiredHeight
-                } ?: videoSizes.filter { it.width <= desiredWidth && it.height <= desiredHeight }
-                    .maxByOrNull { it.width.toLong() * it.height.toLong() }
-                    ?: videoSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
-                    ?: Size(1920, 1080)
+            val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+            val videoSizes = map?.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
+            val previewChoices = map?.getOutputSizes(SurfaceTexture::class.java) ?: emptyArray()
 
-                videoResolutionLabel = "${chosenVideoSize.width}x${chosenVideoSize.height}"
-                videoTargetFps = fps.coerceIn(24, 60)
-                videoBitrateMbps = bitrateMbps.coerceIn(8, 120)
-                videoStabilizationEnabled = enableStabilization
-
-                val outDir = File(context.cacheDir, "cinema_recordings").apply { mkdirs() }
-                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
-                val tempVideoFile = File(outDir, "VID_${timestamp}.mp4")
-                currentVideoTempFile = tempVideoFile
-
-                val hasAudioPerm = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
-                    PackageManager.PERMISSION_GRANTED
-                val recordWithAudio = enableAudio && hasAudioPerm
-
-                @Suppress("DEPRECATION")
-                val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
-                    MediaRecorder(context)
+            val camIntId = cameraIdProp.toIntOrNull()
+            @Suppress("DEPRECATION")
+            val highProfile = try {
+                if (camIntId != null && CamcorderProfile.hasProfile(camIntId, CamcorderProfile.QUALITY_HIGH)) {
+                    CamcorderProfile.get(camIntId, CamcorderProfile.QUALITY_HIGH)
+                } else if (CamcorderProfile.hasProfile(CamcorderProfile.QUALITY_HIGH)) {
+                    CamcorderProfile.get(CamcorderProfile.QUALITY_HIGH)
                 } else {
-                    MediaRecorder()
+                    null
                 }
+            } catch (_: Throwable) {
+                null
+            }
 
-                if (recordWithAudio) {
-                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            val maxProfileW = highProfile?.videoFrameWidth ?: 3840
+            val maxProfileH = highProfile?.videoFrameHeight ?: 2160
+
+            val desiredWidth = if (useSafeFallback) {
+                min(1920, maxProfileW)
+            } else {
+                when (resolutionPreset.uppercase(Locale.US)) {
+                    "4K", "UHD", "2160P" -> min(3840, maxProfileW)
+                    "720P", "HD" -> 1280
+                    else -> min(1920, maxProfileW)
                 }
-                recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
-                recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
-                recorder.setOutputFile(tempVideoFile.absolutePath)
-                recorder.setVideoEncodingBitRate(videoBitrateMbps * 1_000_000)
-                recorder.setVideoFrameRate(videoTargetFps)
-                recorder.setVideoSize(chosenVideoSize.width, chosenVideoSize.height)
-                recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
-                if (recordWithAudio) {
-                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
-                    recorder.setAudioEncodingBitRate(192_000)
-                    recorder.setAudioSamplingRate(48_000)
+            }
+            val desiredHeight = if (useSafeFallback) {
+                min(1080, maxProfileH)
+            } else {
+                when (resolutionPreset.uppercase(Locale.US)) {
+                    "4K", "UHD", "2160P" -> min(2160, maxProfileH)
+                    "720P", "HD" -> 720
+                    else -> min(1080, maxProfileH)
                 }
+            }
 
-                val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
-                recorder.setOrientationHint(sensorOrientation)
-                recorder.prepare()
+            val chosenVideoSize = videoSizes.firstOrNull {
+                it.width == desiredWidth && it.height == desiredHeight
+            } ?: videoSizes.filter {
+                it.width <= desiredWidth && it.height <= desiredHeight &&
+                    abs(it.width.toDouble() / it.height - 16.0 / 9.0) < 0.1
+            }.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                ?: videoSizes.filter { it.width <= desiredWidth && it.height <= desiredHeight }
+                    .maxByOrNull { it.width.toLong() * it.height.toLong() }
+                ?: Size(min(1920, maxProfileW), min(1080, maxProfileH))
 
-                mediaRecorder = recorder
-                val recorderSurface = recorder.surface
+            // Query hardware minimum frame duration for this exact video size to prevent
+            // requesting 60fps on a resolution where the sensor/encoder only supports 30fps.
+            val minFrameDurationNs = try {
+                map?.getOutputMinFrameDuration(MediaRecorder::class.java, chosenVideoSize) ?: 0L
+            } catch (_: Throwable) {
+                0L
+            }
+            val maxSupportedFpsForSize = if (minFrameDurationNs > 0L) {
+                (1_000_000_000.0 / minFrameDurationNs.toDouble()).roundToInt().coerceIn(15, 60)
+            } else {
+                highProfile?.videoFrameRate ?: 30
+            }
 
-                texture.setDefaultBufferSize(previewSize.width, previewSize.height)
-                val previewSurface = Surface(texture)
+            val requestedFps = if (useSafeFallback) {
+                min(30, maxSupportedFpsForSize)
+            } else {
+                fps.coerceIn(24, maxSupportedFpsForSize)
+            }
+            val matchedFpsRange = selectHardwareFpsRange(chars, requestedFps)
+            videoTargetFps = (matchedFpsRange?.upper ?: requestedFps).coerceIn(15, 60)
 
-                val surfaces = mutableListOf<Surface>(previewSurface, recorderSurface)
-                yuvReader?.surface?.let { surfaces.add(it) }
+            val maxSafeBitrateMbps = if (useSafeFallback) {
+                ((highProfile?.videoBitRate ?: 20_000_000) / 1_000_000).coerceIn(8, 35)
+            } else {
+                bitrateMbps.coerceIn(8, 80)
+            }
 
-                device.createCaptureSession(
-                    surfaces,
-                    object : CameraCaptureSession.StateCallback() {
-                        override fun onConfigured(session: CameraCaptureSession) {
-                            captureSession = session
-                            isRecordingVideo = true
-                            isVideoPaused = false
-                            updateRepeatingPreviewRequest()
-                            try {
-                                recorder.start()
-                                videoRecordStartMs = System.currentTimeMillis()
-                                val resMap = Arguments.createMap().apply {
-                                    putString("resolution", videoResolutionLabel)
-                                    putInt("fps", videoTargetFps)
-                                    putInt("bitrateMbps", videoBitrateMbps)
-                                    putBoolean("audioEnabled", recordWithAudio)
-                                }
-                                promise.resolve(resMap)
-                            } catch (startErr: Throwable) {
-                                isRecordingVideo = false
-                                releaseMediaRecorder()
+            videoResolutionLabel = "${chosenVideoSize.width}x${chosenVideoSize.height}"
+            videoBitrateMbps = maxSafeBitrateMbps
+            videoStabilizationEnabled = enableStabilization
+
+            // Choose a 16:9 (or aspect-matched) preview surface size <= 1920x1080 so the
+            // Camera2 stream combination [PRIV preview + PRIV MediaRecorder] is guaranteed.
+            val targetAspect = chosenVideoSize.width.toDouble() / chosenVideoSize.height.toDouble()
+            val videoPreviewSize = previewChoices.filter {
+                it.width <= 1920 && it.height <= 1080 &&
+                    it.width <= chosenVideoSize.width && it.height <= chosenVideoSize.height &&
+                    abs(it.width.toDouble() / it.height - targetAspect) < 0.08
+            }.maxByOrNull { it.width * it.height }
+                ?: previewChoices.filter { it.width <= 1920 && it.height <= 1080 }
+                    .maxByOrNull { it.width * it.height }
+                ?: Size(1280, 720)
+
+            previewSize = videoPreviewSize
+            post {
+                if (textureView.width > 0 && textureView.height > 0) {
+                    configureTextureTransform(textureView.width, textureView.height)
+                }
+            }
+
+            val outDir = File(context.cacheDir, "cinema_recordings").apply { mkdirs() }
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+            val tempVideoFile = File(outDir, "VID_${timestamp}.mp4")
+            currentVideoTempFile = tempVideoFile
+
+            val hasAudioPerm = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                PackageManager.PERMISSION_GRANTED
+            val recordWithAudio = enableAudio && hasAudioPerm
+
+            @Suppress("DEPRECATION")
+            val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                MediaRecorder(context)
+            } else {
+                MediaRecorder()
+            }
+
+            if (recordWithAudio) {
+                recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+            }
+            recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+            recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+            recorder.setOutputFile(tempVideoFile.absolutePath)
+            recorder.setVideoEncodingBitRate(videoBitrateMbps * 1_000_000)
+            recorder.setVideoFrameRate(videoTargetFps)
+            recorder.setVideoSize(chosenVideoSize.width, chosenVideoSize.height)
+            recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+            if (recordWithAudio) {
+                recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                recorder.setAudioEncodingBitRate(192_000)
+                recorder.setAudioSamplingRate(48_000)
+            }
+
+            val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+            recorder.setOrientationHint(sensorOrientation)
+            recorder.prepare()
+
+            mediaRecorder = recorder
+            val recorderSurface = recorder.surface
+
+            texture.setDefaultBufferSize(videoPreviewSize.width, videoPreviewSize.height)
+            val previewSurface = Surface(texture)
+
+            // Strictly 2 surfaces (Preview + MediaRecorder) for maximum Camera2 HAL compatibility
+            val surfaces = listOf(previewSurface, recorderSurface)
+
+            device.createCaptureSession(
+                surfaces,
+                object : CameraCaptureSession.StateCallback() {
+                    override fun onConfigured(session: CameraCaptureSession) {
+                        captureSession = session
+                        isRecordingVideo = true
+                        isVideoPaused = false
+                        updateRepeatingPreviewRequest()
+                        try {
+                            recorder.start()
+                            videoRecordStartMs = System.currentTimeMillis()
+                            val resMap = Arguments.createMap().apply {
+                                putString("resolution", videoResolutionLabel)
+                                putInt("fps", videoTargetFps)
+                                putInt("bitrateMbps", videoBitrateMbps)
+                                putBoolean("audioEnabled", recordWithAudio)
+                            }
+                            promise.resolve(resMap)
+                        } catch (startErr: Throwable) {
+                            Log.w(TAG, "MediaRecorder.start failed (fallback=$useSafeFallback): ${startErr.message}")
+                            isRecordingVideo = false
+                            releaseMediaRecorder()
+                            if (!useSafeFallback) {
+                                startVideoRecordingInternal(
+                                    resolutionPreset = "1080P",
+                                    fps = 30,
+                                    bitrateMbps = 20,
+                                    enableAudio = enableAudio,
+                                    enableStabilization = enableStabilization,
+                                    useSafeFallback = true,
+                                    promise = promise
+                                )
+                            } else {
+                                setupStillImageReaders(chars)
                                 createPreviewSession(allowRawSurface = true)
                                 promise.reject(
                                     "VIDEO_START_ERROR",
@@ -1462,22 +1691,50 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
                                 )
                             }
                         }
+                    }
 
-                        override fun onConfigureFailed(session: CameraCaptureSession) {
-                            isRecordingVideo = false
-                            releaseMediaRecorder()
+                    override fun onConfigureFailed(session: CameraCaptureSession) {
+                        Log.w(TAG, "Video session onConfigureFailed ($videoResolutionLabel @ ${videoTargetFps}fps, fallback=$useSafeFallback)")
+                        isRecordingVideo = false
+                        releaseMediaRecorder()
+                        if (!useSafeFallback) {
+                            startVideoRecordingInternal(
+                                resolutionPreset = "1080P",
+                                fps = 30,
+                                bitrateMbps = 20,
+                                enableAudio = enableAudio,
+                                enableStabilization = enableStabilization,
+                                useSafeFallback = true,
+                                promise = promise
+                            )
+                        } else {
+                            setupStillImageReaders(chars)
                             createPreviewSession(allowRawSurface = true)
                             promise.reject(
                                 "VIDEO_SESSION_FAILED",
-                                "Camera2 rejected video recording stream configuration ($videoResolutionLabel @ ${videoTargetFps}fps)."
+                                "Camera2 rejected video stream configuration ($videoResolutionLabel @ ${videoTargetFps}fps)."
                             )
                         }
-                    },
-                    cameraHandler
+                    }
+                },
+                cameraHandler
+            )
+        } catch (e: Throwable) {
+            Log.e(TAG, "Exception setting up video recording (fallback=$useSafeFallback)", e)
+            isRecordingVideo = false
+            releaseMediaRecorder()
+            if (!useSafeFallback) {
+                startVideoRecordingInternal(
+                    resolutionPreset = "1080P",
+                    fps = 30,
+                    bitrateMbps = 20,
+                    enableAudio = enableAudio,
+                    enableStabilization = enableStabilization,
+                    useSafeFallback = true,
+                    promise = promise
                 )
-            } catch (e: Throwable) {
-                isRecordingVideo = false
-                releaseMediaRecorder()
+            } else {
+                setupStillImageReaders(chars)
                 createPreviewSession(allowRawSurface = true)
                 promise.reject("VIDEO_SETUP_ERROR", "Could not initialize video recorder: ${e.message}", e)
             }
@@ -1550,6 +1807,11 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
             } catch (stopErr: Throwable) {
                 Log.w(TAG, "MediaRecorder stop warning: ${stopErr.message}")
             } finally {
+                try {
+                    captureSession?.close()
+                } catch (_: Throwable) {
+                }
+                captureSession = null
                 isRecordingVideo = false
                 isVideoPaused = false
                 releaseMediaRecorder()
@@ -1557,20 +1819,70 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
 
             var savedUri: String? = null
             var fileSizeMb = 0.0
+            var thumbUriString = ""
+            val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+
             if (tempFile != null && tempFile.exists() && tempFile.length() > 0L) {
                 fileSizeMb = ((tempFile.length().toDouble() / (1024.0 * 1024.0)) * 100.0).roundToInt() / 100.0
-                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
                 savedUri = saveVideoFileToMediaStore(
                     sourceFile = tempFile,
                     displayName = "CINEMA_${timestamp}_${videoResolutionLabel}.mp4"
                 )
+
+                // Extract a crisp JPEG frame thumbnail from the recorded MP4 for the in-app camera roll button
+                try {
+                    val retriever = MediaMetadataRetriever()
+                    retriever.setDataSource(tempFile.absolutePath)
+                    val frameBitmap = retriever.getFrameAtTime(0L, MediaMetadataRetriever.OPTION_CLOSEST_SYNC)
+                        ?: retriever.frameAtTime
+                    retriever.release()
+                    if (frameBitmap != null) {
+                        val thumbDir = File(context.cacheDir, "captured_media_thumbs").apply { mkdirs() }
+                        val thumbFile = File(thumbDir, "VTHUMB_${timestamp}.jpg")
+                        FileOutputStream(thumbFile).use { out ->
+                            frameBitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)
+                        }
+                        frameBitmap.recycle()
+                        thumbUriString = "file://${thumbFile.absolutePath}"
+                    }
+                } catch (thumbErr: Throwable) {
+                    Log.w(TAG, "Failed extracting video thumbnail: ${thumbErr.message}")
+                }
+
+                val localVideoUri = "file://${tempFile.absolutePath}"
+                registerAndEmitCapturedMedia(
+                    id = "video_$timestamp",
+                    uri = localVideoUri,
+                    thumbnailUri = thumbUriString.ifEmpty { localVideoUri },
+                    mediaStoreUri = savedUri ?: "",
+                    isVideo = true,
+                    modeBadge = "MP4",
+                    title = "Cinema $videoResolutionLabel • ${videoTargetFps}fps",
+                    subtitle = "${durationSec}s • ${fileSizeMb} MB • ${videoBitrateMbps} Mbps",
+                    width = videoResolutionLabel.substringBefore("x").toIntOrNull() ?: 1920,
+                    height = videoResolutionLabel.substringAfter("x").toIntOrNull() ?: 1080,
+                    durationSec = durationSec
+                )
             }
 
-            // Re-establish standard still/preview session
+            // Re-establish standard still/preview ImageReaders and session
+            activeCharacteristics?.let { chars ->
+                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val previewCandidates = map?.getOutputSizes(SurfaceTexture::class.java) ?: arrayOf(Size(1920, 1080))
+                previewSize = chooseOptimalPreviewSize(previewCandidates, 1920, 1080)
+                post {
+                    if (textureView.width > 0 && textureView.height > 0) {
+                        configureTextureTransform(textureView.width, textureView.height)
+                    }
+                }
+                setupStillImageReaders(chars)
+            }
             createPreviewSession(allowRawSurface = true)
 
             val result = Arguments.createMap().apply {
                 putString("videoUri", savedUri ?: (tempFile?.let { "file://${it.absolutePath}" } ?: ""))
+                putString("localUri", tempFile?.let { "file://${it.absolutePath}" } ?: "")
+                putString("thumbnailUri", thumbUriString)
                 putString("resolution", videoResolutionLabel)
                 putInt("fps", videoTargetFps)
                 putInt("bitrateMbps", videoBitrateMbps)
@@ -1749,8 +2061,30 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
                     updateRepeatingPreviewRequest()
 
                     val totalSec = ((totalIntegrationNs.toDouble() / 1_000_000_000.0) * 100.0).roundToInt() / 100.0
+                    val localFileUri = "file://${finalCacheFile.absolutePath}"
+                    val badgeLabel = when (modeCode) {
+                        1 -> "HDR+"
+                        2 -> "TRAILS"
+                        3 -> "SR-NR"
+                        4 -> "MACRO"
+                        else -> "LAB"
+                    }
+                    registerAndEmitCapturedMedia(
+                        id = "mode_${modeCode}_$timestamp",
+                        uri = localFileUri,
+                        thumbnailUri = localFileUri,
+                        mediaStoreUri = savedMediaUri ?: "",
+                        isVideo = false,
+                        modeBadge = badgeLabel,
+                        title = "$modePrefix ($capturedFrames Frames)",
+                        subtitle = "${totalSec}s total • ISO $clampedIso",
+                        width = stackWidth,
+                        height = stackHeight,
+                        durationSec = 0.0
+                    )
+
                     val response = Arguments.createMap().apply {
-                        putString("stackedUri", "file://${finalCacheFile.absolutePath}")
+                        putString("stackedUri", localFileUri)
                         putString("mediaStoreUri", savedMediaUri ?: "")
                         putString("singleFrameUri", firstFrameFile?.let { "file://${it.absolutePath}" } ?: "")
                         putInt("framesStacked", capturedFrames)
@@ -1911,6 +2245,67 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
         }
     }
 
+    /**
+     * Persists a JSON descriptor for every captured photo or video in `cacheDir/captured_media`
+     * and emits an immediate `"onMediaCaptured"` event so all tabs update their bottom-corner
+     * camera-roll preview thumbnail in real time.
+     */
+    private fun registerAndEmitCapturedMedia(
+        id: String,
+        uri: String,
+        thumbnailUri: String,
+        mediaStoreUri: String,
+        isVideo: Boolean,
+        modeBadge: String,
+        title: String,
+        subtitle: String,
+        width: Int = 1920,
+        height: Int = 1080,
+        durationSec: Double = 0.0
+    ) {
+        try {
+            val createdAtMs = System.currentTimeMillis()
+            val indexDir = File(context.cacheDir, "captured_media").apply { mkdirs() }
+            val jsonFile = File(indexDir, "$id.json")
+            val json = JSONObject().apply {
+                put("id", id)
+                put("uri", uri)
+                put("thumbnailUri", thumbnailUri)
+                put("mediaStoreUri", mediaStoreUri)
+                put("isVideo", isVideo)
+                put("modeBadge", modeBadge)
+                put("title", title)
+                put("subtitle", subtitle)
+                put("width", width)
+                put("height", height)
+                put("durationSec", durationSec)
+                put("timestampMs", createdAtMs)
+            }
+            jsonFile.writeText(json.toString())
+
+            val payload = Arguments.createMap().apply {
+                putString("id", id)
+                putString("uri", uri)
+                putString("thumbnailUri", thumbnailUri)
+                putString("mediaStoreUri", mediaStoreUri)
+                putBoolean("isVideo", isVideo)
+                putString("modeBadge", modeBadge)
+                putString("title", title)
+                putString("subtitle", subtitle)
+                putInt("width", width)
+                putInt("height", height)
+                putDouble("durationSec", durationSec)
+                putDouble("timestampMs", createdAtMs.toDouble())
+            }
+            val reactContext = context as? ReactContext ?: return
+            reactContext
+                .getJSModule(DeviceEventManagerModule.RCTDeviceEventEmitter::class.java)
+                .emit("onMediaCaptured", payload)
+        } catch (e: Throwable) {
+            Log.w(TAG, "Failed registering captured media item: ${e.message}")
+        }
+    }
+
     private fun closeCameraInternal() {
         val handler = cameraHandler
         if (handler != null) {
@@ -1925,6 +2320,15 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
     private fun closeCameraOnCurrentThread() {
         try {
             cameraOpenCloseLock.tryAcquire(1500, TimeUnit.MILLISECONDS)
+            if (isRecordingVideo) {
+                try {
+                    mediaRecorder?.stop()
+                } catch (_: Throwable) {
+                }
+                isRecordingVideo = false
+                isVideoPaused = false
+                releaseMediaRecorder()
+            }
             try {
                 captureSession?.stopRepeating()
             } catch (_: Throwable) {
@@ -1948,6 +2352,9 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
             rawReader?.close()
             rawReader = null
             rawSurfaceConfigured = false
+            if (currentCameraOwner === this) {
+                currentCameraOwner = null
+            }
         } finally {
             if (cameraOpenCloseLock.availablePermits() == 0) {
                 cameraOpenCloseLock.release()
