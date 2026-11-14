@@ -1,6 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
-  ActivityIndicator,
   Alert,
   Image,
   Modal,
@@ -85,7 +84,13 @@ export default function AstroModeScreen() {
   }, []);
 
   useEffect(() => {
-    requestCameraPermissions();
+    if (Platform.OS === 'android') {
+      PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA)
+        .then((granted) => {
+          setHasPermission(granted === PermissionsAndroid.RESULTS.GRANTED);
+        })
+        .catch(() => setHasPermission(false));
+    }
     inspectDeviceCameras()
       .then((rep) => {
         setSensors(rep.sensors);
@@ -94,7 +99,7 @@ export default function AstroModeScreen() {
         }
       })
       .catch(() => {});
-  }, [requestCameraPermissions]);
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -752,7 +757,11 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   progressivePreviewOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
     backgroundColor: '#000',
   },
   progressiveImage: {
@@ -779,7 +788,11 @@ const styles = StyleSheet.create({
     fontWeight: '800',
   },
   captureHudOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
     alignItems: 'center',
     justifyContent: 'center',
     padding: 24,

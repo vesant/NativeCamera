@@ -103,7 +103,18 @@ export default function ProModeScreen() {
   }, []);
 
   useEffect(() => {
-    requestCameraPermissions();
+    if (Platform.OS === 'android') {
+      PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.CAMERA, {
+        title: 'Camera Hardware Access',
+        message:
+          'NativeCamera requires direct Camera2 access for manual exposure, RAW DNG capture, and astrophotography.',
+        buttonPositive: 'Allow',
+      })
+        .then((granted) => {
+          setHasPermission(granted === PermissionsAndroid.RESULTS.GRANTED);
+        })
+        .catch(() => setHasPermission(false));
+    }
     inspectDeviceCameras()
       .then((rep) => {
         setSensors(rep.sensors);
@@ -112,7 +123,7 @@ export default function ProModeScreen() {
         }
       })
       .catch(() => {});
-  }, [requestCameraPermissions]);
+  }, []);
 
   useFocusEffect(
     useCallback(() => {
@@ -732,6 +743,7 @@ export default function ProModeScreen() {
                     onPress={() => {
                       setManualWb(true);
                       setWbKelvin(preset.kelvin);
+                      setWbTint(0);
                     }}
                   >
                     <Text style={styles.wbPresetText}>{preset.label}</Text>
@@ -903,7 +915,11 @@ const styles = StyleSheet.create({
     flex: 1,
   },
   gridOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
   },
   gridLineV: {
     position: 'absolute',
@@ -920,7 +936,11 @@ const styles = StyleSheet.create({
     backgroundColor: 'rgba(248, 250, 252, 0.24)',
   },
   spiritLevelOverlay: {
-    ...StyleSheet.absoluteFillObject,
+    position: 'absolute',
+    top: 0,
+    right: 0,
+    bottom: 0,
+    left: 0,
     alignItems: 'center',
     justifyContent: 'center',
   },

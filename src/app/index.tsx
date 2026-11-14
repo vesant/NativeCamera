@@ -42,8 +42,25 @@ export default function SensorInfoScreen() {
   }, []);
 
   useEffect(() => {
-    loadHardwareReport();
-  }, [loadHardwareReport]);
+    let mounted = true;
+    inspectDeviceCameras()
+      .then((data) => {
+        if (!mounted) return;
+        setReport(data);
+        setSelectedIndex(0);
+        setError(null);
+      })
+      .catch((err: any) => {
+        if (!mounted) return;
+        setError(err?.message ?? 'Unable to query Camera2 characteristics.');
+      })
+      .finally(() => {
+        if (mounted) setLoading(false);
+      });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const handleCopyJsonReport = useCallback(async () => {
     if (!report?.jsonReport) return;

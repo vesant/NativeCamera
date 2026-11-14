@@ -10,7 +10,7 @@ import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 export default function RootLayout() {
   return (
     <>
-      <StatusBar style="light" backgroundColor="#07090D" />
+      <StatusBar style="light" />
       <Tabs
         screenOptions={{
           headerShown: false,
@@ -36,7 +36,7 @@ export default function RootLayout() {
           options={{
             title: 'Sensor Info',
             tabBarIcon: ({ color, size }) => (
-              <MaterialCommunityIcons name="chip" size={size} color={color} />
+              <MaterialCommunityIcons name="chip" size={size} color={String(color)} />
             ),
           }}
         />
@@ -45,7 +45,7 @@ export default function RootLayout() {
           options={{
             title: 'Pro Mode',
             tabBarIcon: ({ color, size }) => (
-              <Ionicons name="aperture-outline" size={size} color={color} />
+              <Ionicons name="aperture-outline" size={size} color={String(color)} />
             ),
           }}
         />
@@ -54,7 +54,7 @@ export default function RootLayout() {
           options={{
             title: 'Astro Mode',
             tabBarIcon: ({ color, size }) => (
-              <Ionicons name="sparkles-outline" size={size} color={color} />
+              <Ionicons name="sparkles-outline" size={size} color={String(color)} />
             ),
           }}
         />

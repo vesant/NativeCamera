@@ -1,7 +1,7 @@
-import React, { useMemo, useRef, useState } from 'react';
+import React, { useState } from 'react';
 import {
+  GestureResponderEvent,
   LayoutChangeEvent,
-  PanResponder,
   StyleSheet,
   Text,
   View,
@@ -17,9 +17,9 @@ interface PrecisionSliderProps {
 }
 
 /**
- * Tactile camera dial / slider built on PanResponder so we can map either linear
- * parameters (ISO, Focus Diopters, Kelvin) or logarithmic parameters (Shutter Speed)
- * smoothly at 60fps.
+ * Tactile camera dial / slider built on native Responder touch callbacks so we can map
+ * either linear parameters (ISO, Focus Diopters, Kelvin) or logarithmic parameters
+ * (Shutter Speed) smoothly at 60fps.
  */
 export function PrecisionSlider({
   value,
@@ -30,36 +30,18 @@ export function PrecisionSlider({
   accentColor = '#F59E0B',
 }: PrecisionSliderProps) {
   const [trackWidth, setTrackWidth] = useState<number>(1);
-  const trackWidthRef = useRef<number>(1);
-  const onChangeRef = useRef(onChange);
-  onChangeRef.current = onChange;
 
   const handleLayout = (e: LayoutChangeEvent) => {
     const w = Math.max(1, e.nativeEvent.layout.width);
-    trackWidthRef.current = w;
     setTrackWidth(w);
   };
 
-  const panResponder = useMemo(
-    () =>
-      PanResponder.create({
-        onStartShouldSetPanResponder: () => !disabled,
-        onMoveShouldSetPanResponder: () => !disabled,
-        onPanResponderGrant: (evt) => {
-          if (disabled) return;
-          const x = evt.nativeEvent.locationX;
-          const norm = Math.max(0, Math.min(1, x / trackWidthRef.current));
-          onChangeRef.current(norm);
-        },
-        onPanResponderMove: (evt) => {
-          if (disabled) return;
-          const x = evt.nativeEvent.locationX;
-          const norm = Math.max(0, Math.min(1, x / trackWidthRef.current));
-          onChangeRef.current(norm);
-        },
-      }),
-    [disabled]
-  );
+  const updateFromTouch = (evt: GestureResponderEvent) => {
+    if (disabled) return;
+    const x = evt.nativeEvent.locationX;
+    const norm = Math.max(0, Math.min(1, x / Math.max(1, trackWidth)));
+    onChange(norm);
+  };
 
   const clamped = Math.max(0, Math.min(1, value));
   const thumbLeft = clamped * Math.max(0, trackWidth - 20);
@@ -69,7 +51,10 @@ export function PrecisionSlider({
       <View
         style={styles.touchArea}
         onLayout={handleLayout}
-        {...panResponder.panHandlers}
+        onStartShouldSetResponder={() => !disabled}
+        onMoveShouldSetResponder={() => !disabled}
+        onResponderGrant={updateFromTouch}
+        onResponderMove={updateFromTouch}
       >
         {/* Dial tick marks */}
         <View style={styles.ticksRow} pointerEvents="none">
