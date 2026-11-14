@@ -687,6 +687,324 @@ Java_com_vesant_nativecamera_AstroStackerNative_finalizeStack(
     return env->NewStringUTF(json.str().c_str());
 }
 
+JNIEXPORT jstring JNICALL
+Java_com_vesant_nativecamera_AstroStackerNative_addUnalignedFrameAndGetPreview(
+    JNIEnv* env,
+    jclass /* clazz */,
+    jintArray frameArgbArray,
+    jint frameIndex,
+    jint previewMode,
+    jintArray previewArgbOut
+) {
+    std::lock_guard<std::mutex> lock(gSessionMutex);
+    const int width = gSession.width;
+    const int height = gSession.height;
+    const size_t numPixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+
+    if (width <= 0 || height <= 0 || frameIndex >= gSession.maxFrames) {
+        return env->NewStringUTF("Session not ready");
+    }
+
+    jint* srcPixels = env->GetIntArrayElements(frameArgbArray, nullptr);
+    jint* outPreview = env->GetIntArrayElements(previewArgbOut, nullptr);
+
+    uint8_t* dstFramePtr =
+        gSession.alignedFramesRgb.data() + (static_cast<size_t>(frameIndex) * numPixels * 3);
+    const int currentTotalFrames = frameIndex + 1;
+    gSession.frameCount = currentTotalFrames;
+
+    for (size_t idx = 0; idx < numPixels; ++idx) {
+        uint32_t px = static_cast<uint32_t>(srcPixels[idx]);
+        uint8_t r = (px >> 16) & 0xFF;
+        uint8_t g = (px >> 8) & 0xFF;
+        uint8_t b = px & 0xFF;
+
+        dstFramePtr[idx * 3 + 0] = r;
+        dstFramePtr[idx * 3 + 1] = g;
+        dstFramePtr[idx * 3 + 2] = b;
+
+        if (previewMode == 2) {
+            // Light Trails mode: running maximum per channel for real-time light-painting preview
+            gSession.runningSumR[idx] = std::max(gSession.runningSumR[idx], static_cast<uint32_t>(r));
+            gSession.runningSumG[idx] = std::max(gSession.runningSumG[idx], static_cast<uint32_t>(g));
+            gSession.runningSumB[idx] = std::max(gSession.runningSumB[idx], static_cast<uint32_t>(b));
+
+            outPreview[idx] = static_cast<jint>(
+                0xFF000000u |
+                (gSession.runningSumR[idx] << 16) |
+                (gSession.runningSumG[idx] << 8) |
+                gSession.runningSumB[idx]
+            );
+        } else {
+            gSession.runningSumR[idx] += r;
+            gSession.runningSumG[idx] += g;
+            gSession.runningSumB[idx] += b;
+
+            uint8_t avgR = static_cast<uint8_t>(gSession.runningSumR[idx] / currentTotalFrames);
+            uint8_t avgG = static_cast<uint8_t>(gSession.runningSumG[idx] / currentTotalFrames);
+            uint8_t avgB = static_cast<uint8_t>(gSession.runningSumB[idx] / currentTotalFrames);
+
+            outPreview[idx] = static_cast<jint>(
+                0xFF000000u |
+                (static_cast<uint32_t>(avgR) << 16) |
+                (static_cast<uint32_t>(avgG) << 8) |
+                static_cast<uint32_t>(avgB)
+            );
+        }
+    }
+
+    env->ReleaseIntArrayElements(frameArgbArray, srcPixels, JNI_ABORT);
+    env->ReleaseIntArrayElements(previewArgbOut, outPreview, 0);
+
+    std::ostringstream oss;
+    oss << "Captured & buffered frame " << currentTotalFrames << "/" << gSession.maxFrames;
+    return env->NewStringUTF(oss.str().c_str());
+}
+
+/**
+ * Finalizes multi-frame computational photography modes:
+ * modeCode = 1: HDR+ Exposure Bracketing (Mertens Contrast + Saturation + Well-Exposedness Fusion)
+ * modeCode = 2: Light Trails / Star Trails (Temporal Maximum with Background Noise Floor Lock)
+ * modeCode = 3: Night Super-Resolution & Multi-Frame Denoise (Aligned Trimmed Mean + Unsharp Mask)
+ * modeCode = 4: Macro Focus Stacking (Laplacian High-Frequency Sharpness Map Fusion)
+ */
+JNIEXPORT jstring JNICALL
+Java_com_vesant_nativecamera_AstroStackerNative_finalizeComputationalMode(
+    JNIEnv* env,
+    jclass /* clazz */,
+    jint modeCode,
+    jintArray finalArgbOut
+) {
+    std::lock_guard<std::mutex> lock(gSessionMutex);
+    const int width = gSession.width;
+    const int height = gSession.height;
+    const int nFrames = gSession.frameCount;
+    const size_t numPixels = static_cast<size_t>(width) * static_cast<size_t>(height);
+
+    if (width <= 0 || height <= 0 || nFrames <= 0) {
+        return env->NewStringUTF("{}");
+    }
+
+    jint* outPixels = env->GetIntArrayElements(finalArgbOut, nullptr);
+    const size_t frameStride = numPixels * 3;
+    const uint8_t* basePtr = gSession.alignedFramesRgb.data();
+
+    std::vector<float> fusedR(numPixels, 0.0f);
+    std::vector<float> fusedG(numPixels, 0.0f);
+    std::vector<float> fusedB(numPixels, 0.0f);
+
+    if (modeCode == 1) {
+        // MODE 1: HDR+ Mertens Exposure Fusion
+        // Weighs every pixel in each bracketed exposure by Well-Exposedness (Gaussian centered at 0.52),
+        // RGB Saturation spread, and local gradient contrast.
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t idx = static_cast<size_t>(y) * width + x;
+                const size_t pxOff = idx * 3;
+
+                float weightSum = 0.0f;
+                float accR = 0.0f, accG = 0.0f, accB = 0.0f;
+
+                for (int f = 0; f < nFrames; ++f) {
+                    const uint8_t* fp = basePtr + f * frameStride + pxOff;
+                    float r = fp[0] / 255.0f;
+                    float g = fp[1] / 255.0f;
+                    float b = fp[2] / 255.0f;
+
+                    // Well-exposedness: Gaussian curve peaking at 0.52 (avoids clipped 1.0 & crushed 0.0)
+                    float er = std::exp(-((r - 0.52f) * (r - 0.52f)) / (2.0f * 0.22f * 0.22f));
+                    float eg = std::exp(-((g - 0.52f) * (g - 0.52f)) / (2.0f * 0.22f * 0.22f));
+                    float eb = std::exp(-((b - 0.52f) * (b - 0.52f)) / (2.0f * 0.22f * 0.22f));
+                    float wellExposed = er * eg * eb;
+
+                    // Saturation: standard deviation across R, G, B channels
+                    float meanRgb = (r + g + b) / 3.0f;
+                    float sat = std::sqrt(
+                        ((r - meanRgb) * (r - meanRgb) +
+                         (g - meanRgb) * (g - meanRgb) +
+                         (b - meanRgb) * (b - meanRgb)) / 3.0f
+                    );
+
+                    // Local contrast: 4-neighbor Laplacian magnitude
+                    float contrast = 0.05f;
+                    if (x > 0 && x + 1 < width && y > 0 && y + 1 < height) {
+                        const uint8_t* left = basePtr + f * frameStride + (idx - 1) * 3;
+                        const uint8_t* right = basePtr + f * frameStride + (idx + 1) * 3;
+                        const uint8_t* up = basePtr + f * frameStride + (idx - width) * 3;
+                        const uint8_t* down = basePtr + f * frameStride + (idx + width) * 3;
+                        float lapG = std::fabs(
+                            4.0f * fp[1] - (left[1] + right[1] + up[1] + down[1])
+                        ) / 255.0f;
+                        contrast += lapG;
+                    }
+
+                    float w = std::max(1e-4f, wellExposed * (0.25f + sat) * (0.25f + contrast));
+                    accR += w * fp[0];
+                    accG += w * fp[1];
+                    accB += w * fp[2];
+                    weightSum += w;
+                }
+
+                fusedR[idx] = accR / weightSum;
+                fusedG[idx] = accG / weightSum;
+                fusedB[idx] = accB / weightSum;
+            }
+        }
+    } else if (modeCode == 2) {
+        // MODE 2: Light Trails / Star Trails & Traffic Light Painting
+        // Combines temporal mean for static dark background (reducing dark noise by sqrt(N))
+        // with temporal maximum for moving light streaks!
+        for (size_t idx = 0; idx < numPixels; ++idx) {
+            const size_t pxOff = idx * 3;
+            float sumR = 0.0f, sumG = 0.0f, sumB = 0.0f;
+            float maxR = 0.0f, maxG = 0.0f, maxB = 0.0f;
+            float maxLuma = -1.0f;
+
+            for (int f = 0; f < nFrames; ++f) {
+                const uint8_t* fp = basePtr + f * frameStride + pxOff;
+                float r = fp[0];
+                float g = fp[1];
+                float b = fp[2];
+                sumR += r;
+                sumG += g;
+                sumB += b;
+                float luma = 0.299f * r + 0.587f * g + 0.114f * b;
+                if (luma > maxLuma) {
+                    maxLuma = luma;
+                    maxR = r;
+                    maxG = g;
+                    maxB = b;
+                }
+            }
+
+            float meanR = sumR / nFrames;
+            float meanG = sumG / nFrames;
+            float meanB = sumB / nFrames;
+            float meanLuma = 0.299f * meanR + 0.587f * meanG + 0.114f * meanB;
+
+            // Blend factor: pixels where a bright moving light passed (maxLuma >> meanLuma)
+            // take the peak light-trail value; static background pixels keep the clean mean.
+            float trailDelta = std::max(0.0f, maxLuma - meanLuma - 10.0f);
+            float alpha = std::clamp(trailDelta / 38.0f, 0.0f, 1.0f);
+
+            fusedR[idx] = (1.0f - alpha) * meanR + alpha * maxR;
+            fusedG[idx] = (1.0f - alpha) * meanG + alpha * maxG;
+            fusedB[idx] = (1.0f - alpha) * meanB + alpha * maxB;
+        }
+    } else if (modeCode == 4) {
+        // MODE 4: Macro Focus Bracketing / Depth-of-Field Fusion
+        // Evaluates local 3x3 Laplacian sharpness across all focus-bracketed frames and picks
+        // the sharpest focus slice per pixel.
+        for (int y = 0; y < height; ++y) {
+            for (int x = 0; x < width; ++x) {
+                const size_t idx = static_cast<size_t>(y) * width + x;
+                float bestSharpness = -1.0f;
+                int bestFrame = 0;
+
+                for (int f = 0; f < nFrames; ++f) {
+                    float energy = 0.0f;
+                    if (x > 1 && x + 2 < width && y > 1 && y + 2 < height) {
+                        for (int dy = -1; dy <= 1; ++dy) {
+                            for (int dx = -1; dx <= 1; ++dx) {
+                                size_t cIdx = static_cast<size_t>(y + dy) * width + (x + dx);
+                                const uint8_t* cp = basePtr + f * frameStride + cIdx * 3;
+                                const uint8_t* lp = basePtr + f * frameStride + (cIdx - 1) * 3;
+                                const uint8_t* rp = basePtr + f * frameStride + (cIdx + 1) * 3;
+                                const uint8_t* up = basePtr + f * frameStride + (cIdx - width) * 3;
+                                const uint8_t* dp = basePtr + f * frameStride + (cIdx + width) * 3;
+                                float lap = std::fabs(
+                                    4.0f * cp[1] - (lp[1] + rp[1] + up[1] + dp[1])
+                                );
+                                energy += lap;
+                            }
+                        }
+                    }
+                    if (energy > bestSharpness) {
+                        bestSharpness = energy;
+                        bestFrame = f;
+                    }
+                }
+
+                const uint8_t* bestPtr = basePtr + bestFrame * frameStride + idx * 3;
+                fusedR[idx] = bestPtr[0];
+                fusedG[idx] = bestPtr[1];
+                fusedB[idx] = bestPtr[2];
+            }
+        }
+    } else {
+        // MODE 3: Night Super-Resolution & Multi-Frame Trimmed-Mean Denoise + Unsharp Mask
+        for (size_t idx = 0; idx < numPixels; ++idx) {
+            const size_t pxOff = idx * 3;
+            for (int c = 0; c < 3; ++c) {
+                float sum = 0.0f;
+                float minV = 255.0f;
+                float maxV = 0.0f;
+                for (int f = 0; f < nFrames; ++f) {
+                    float v = basePtr[f * frameStride + pxOff + c];
+                    sum += v;
+                    minV = std::min(minV, v);
+                    maxV = std::max(maxV, v);
+                }
+                // Alpha-trimmed mean drops the highest and lowest outlier sample per pixel
+                float val = (nFrames >= 4)
+                    ? ((sum - minV - maxV) / (nFrames - 2))
+                    : (sum / nFrames);
+                if (c == 0) fusedR[idx] = val;
+                else if (c == 1) fusedG[idx] = val;
+                else fusedB[idx] = val;
+            }
+        }
+    }
+
+    // Apply subtle Unsharp Mask (micro-contrast enhancement) and pack into ARGB_8888 output
+    const float usmAmount = (modeCode == 3 || modeCode == 4) ? 0.38f : 0.18f;
+    for (int y = 0; y < height; ++y) {
+        for (int x = 0; x < width; ++x) {
+            const size_t idx = static_cast<size_t>(y) * width + x;
+            float r = fusedR[idx];
+            float g = fusedG[idx];
+            float b = fusedB[idx];
+
+            if (x > 0 && x + 1 < width && y > 0 && y + 1 < height) {
+                float blurR = 0.25f * (fusedR[idx - 1] + fusedR[idx + 1] + fusedR[idx - width] + fusedR[idx + width]);
+                float blurG = 0.25f * (fusedG[idx - 1] + fusedG[idx + 1] + fusedG[idx - width] + fusedG[idx + width]);
+                float blurB = 0.25f * (fusedB[idx - 1] + fusedB[idx + 1] + fusedB[idx - width] + fusedB[idx + width]);
+                r = std::clamp(r + usmAmount * (r - blurR), 0.0f, 255.0f);
+                g = std::clamp(g + usmAmount * (g - blurG), 0.0f, 255.0f);
+                b = std::clamp(b + usmAmount * (b - blurB), 0.0f, 255.0f);
+            }
+
+            uint8_t outR = static_cast<uint8_t>(r + 0.5f);
+            uint8_t outG = static_cast<uint8_t>(g + 0.5f);
+            uint8_t outB = static_cast<uint8_t>(b + 0.5f);
+
+            outPixels[idx] = static_cast<jint>(
+                0xFF000000u |
+                (static_cast<uint32_t>(outR) << 16) |
+                (static_cast<uint32_t>(outG) << 8) |
+                static_cast<uint32_t>(outB)
+            );
+        }
+    }
+
+    env->ReleaseIntArrayElements(finalArgbOut, outPixels, 0);
+
+    double snrGainFactor = std::sqrt(static_cast<double>(nFrames));
+    double snrDb = 20.0 * std::log10(snrGainFactor);
+
+    std::ostringstream json;
+    json.precision(2);
+    json << std::fixed
+         << "{\"framesStacked\":" << nFrames
+         << ",\"modeCode\":" << modeCode
+         << ",\"referenceStars\":" << gSession.referenceStars.size()
+         << ",\"maxStarDriftPx\":" << gSession.maxDriftPx
+         << ",\"snrImprovementFactor\":" << snrGainFactor
+         << ",\"snrGainDb\":" << snrDb
+         << "}";
+    return env->NewStringUTF(json.str().c_str());
+}
+
 JNIEXPORT void JNICALL
 Java_com_vesant_nativecamera_AstroStackerNative_resetSession(
     JNIEnv* /* env */,

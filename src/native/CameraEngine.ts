@@ -96,6 +96,23 @@ export interface AstroCaptureResult {
   albumPath: string;
 }
 
+export interface VideoStartResult {
+  resolution: string;
+  fps: number;
+  bitrateMbps: number;
+  audioEnabled: boolean;
+}
+
+export interface VideoStopResult {
+  videoUri: string;
+  resolution: string;
+  fps: number;
+  bitrateMbps: number;
+  durationSec: number;
+  fileSizeMb: number;
+  albumPath: string;
+}
+
 interface NativeCameraEngineModuleSpec {
   startMotionSensors(): Promise<boolean>;
   stopMotionSensors(): Promise<boolean>;
@@ -107,6 +124,23 @@ interface NativeCameraEngineModuleSpec {
     abortIfMoved: boolean
   ): Promise<AstroCaptureResult>;
   cancelAstroCapture(): Promise<boolean>;
+  startVideoRecording(
+    resolutionPreset: string,
+    fps: number,
+    bitrateMbps: number,
+    enableAudio: boolean,
+    enableStabilization: boolean
+  ): Promise<VideoStartResult>;
+  pauseVideoRecording(): Promise<boolean>;
+  resumeVideoRecording(): Promise<boolean>;
+  stopVideoRecording(): Promise<VideoStopResult>;
+  startComputationalCapture(
+    modeCode: number,
+    frameCount: number,
+    baseExposureSec: number,
+    iso: number,
+    evStep: number
+  ): Promise<AstroCaptureResult>;
 }
 
 const CameraEngineNative = NativeModules.CameraEngineModule as
@@ -154,6 +188,65 @@ export async function cancelAstroCapture(): Promise<boolean> {
     return false;
   }
   return await CameraEngineNative.cancelAstroCapture();
+}
+
+export async function startVideoRecording(params: {
+  resolutionPreset: '4K' | '1080P' | '720P';
+  fps: 24 | 30 | 60;
+  bitrateMbps: number;
+  enableAudio: boolean;
+  enableStabilization: boolean;
+}): Promise<VideoStartResult> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    throw new Error('CameraEngineModule is only available on Android.');
+  }
+  return await CameraEngineNative.startVideoRecording(
+    params.resolutionPreset,
+    params.fps,
+    params.bitrateMbps,
+    params.enableAudio,
+    params.enableStabilization
+  );
+}
+
+export async function pauseVideoRecording(): Promise<boolean> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    return false;
+  }
+  return await CameraEngineNative.pauseVideoRecording();
+}
+
+export async function resumeVideoRecording(): Promise<boolean> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    return false;
+  }
+  return await CameraEngineNative.resumeVideoRecording();
+}
+
+export async function stopVideoRecording(): Promise<VideoStopResult> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    throw new Error('CameraEngineModule is only available on Android.');
+  }
+  return await CameraEngineNative.stopVideoRecording();
+}
+
+export async function startComputationalCapture(params: {
+  modeCode: 1 | 2 | 3 | 4;
+  frameCount: number;
+  baseExposureSec: number;
+  iso: number;
+  evStep: number;
+}): Promise<AstroCaptureResult> {
+  if (Platform.OS !== 'android' || !CameraEngineNative) {
+    throw new Error('CameraEngineModule is only available on Android.');
+  }
+  return await CameraEngineNative.startComputationalCapture(
+    params.modeCode,
+    params.frameCount,
+    params.baseExposureSec,
+    params.iso,
+    params.evStep
+  );
 }
 
 export function subscribeHistogram(

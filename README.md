@@ -59,6 +59,24 @@ Implemented natively in C++17 ([`astro_stacker_jni.cpp`](android/app/src/main/cp
 
 ---
 
+### Pillar D: Cinema Video Record Mode (`Record` Tab)
+Implemented natively via `CameraDevice.TEMPLATE_RECORD` + `MediaRecorder` in [`CameraEngineView.kt`](android/app/src/main/java/com/vesant/nativecamera/CameraEngineView.kt) and [`src/app/video.tsx`](src/app/video.tsx):
+- **Configurable Cinema Profiles:** Record H.264/AAC `.mp4` streams in `4K UHD` (`3840x2160`), `1080p FHD` (`1920x1080`), or `720p HD` (`1280x720`) at **`24 fps`**, **`30 fps`**, or **`60 fps`** with selectable bitrates (**`24 Mbps`**, **`50 Mbps`**, **`80 Mbps`**).
+- **180° Shutter Angle Cinema Lock:** One-tap lock that sets sensor integration time to $\frac{1}{2 \times \text{fps}}$ (`1/48s` at 24p, `1/60s` at 30p, `1/120s` at 60p) for natural motion cadence.
+- **Live Manual Rack Focus (A/B Focus Pulls) & Exposure While Recording:** Adjust shutter speed, ISO sensitivity, Kelvin white balance, and manual focus in diopters—including programmable **Focus Point A / B** presets—live during an active video recording.
+- **Cinema Viewfinder Aids:** Anamorphic `2.39:1` and `16:9` letterbox guides, live YUV luminance histogram, digital roll readout, Pause/Resume recording, and direct export to `DCIM/NativeCamera` via `MediaStore.Video`.
+
+---
+
+### Pillar E: Multi-Frame C++17 Computational Lab Modes (`Lab Modes` Tab)
+Implemented natively in [`astro_stacker_jni.cpp`](android/app/src/main/cpp/astro_stacker_jni.cpp) and [`src/app/modes.tsx`](src/app/modes.tsx):
+1. **HDR+ Exposure Bracketing (Mertens Exposure Fusion):** Automatically sweeps Camera2 exposure time across `[-2 EV .. +2 EV]` around the base exposure and fuses all brackets in C++17 using per-pixel Laplacian contrast, RGB saturation, and Gaussian well-exposedness weights ($\exp(-\frac{(I - 0.5)^2}{2\sigma^2})$).
+2. **Light Trails & Star Trails (Temporal Max-Blend):** Captures continuous long-exposure sequences and blends moving highlights (traffic trails, light painting, star arcs) via temporal maximum (`lighten`) while averaging static dark sky/background regions to suppress read noise.
+3. **Handheld Night Super-Resolution & Multi-Frame Denoise:** Aligns handheld bursts via C++17 RANSAC keypoint registration, crushes high-ISO chroma noise with alpha-trimmed mean stacking, and restores fine edge micro-contrast with a Laplacian unsharp mask.
+4. **Macro Focus Bracketing (Depth-of-Field Fusion):** Automatically steps the lens voice-coil motor in diopters from closest macro focus (`LENS_INFO_MINIMUM_FOCUS_DISTANCE`) to optical infinity (`0.0f` D) and fuses the sharpest focus plane at every pixel using a $3\times 3$ Laplacian energy map.
+
+---
+
 ## Building from Fedora Linux / Bazzite
 
 ### 1. Prerequisites

@@ -14,9 +14,11 @@
       "package": "com.vesant.nativecamera",
       "permissions": [
         "android.permission.CAMERA",
+        "android.permission.RECORD_AUDIO",
         "android.permission.WRITE_EXTERNAL_STORAGE",
         "android.permission.READ_EXTERNAL_STORAGE",
         "android.permission.READ_MEDIA_IMAGES",
+        "android.permission.READ_MEDIA_VIDEO",
         "android.permission.HIGH_SAMPLING_RATE_SENSORS"
       ],
       "adaptiveIcon": {

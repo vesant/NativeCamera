@@ -1,8 +1,10 @@
 package com.vesant.nativecamera
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.ContentValues
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.ImageFormat
@@ -24,12 +26,14 @@ import android.hardware.camera2.params.ColorSpaceTransform
 import android.hardware.camera2.params.RggbChannelVector
 import android.media.Image
 import android.media.ImageReader
+import android.media.MediaRecorder
 import android.os.Build
 import android.os.Environment
 import android.os.Handler
 import android.os.HandlerThread
 import android.provider.MediaStore
 import android.util.Log
+import android.util.Range
 import android.util.Rational
 import android.util.Size
 import android.view.Surface
@@ -42,6 +46,7 @@ import com.facebook.react.bridge.ReactContext
 import com.facebook.react.modules.core.DeviceEventManagerModule
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.text.SimpleDateFormat
 import java.util.Date
@@ -52,6 +57,7 @@ import kotlin.math.abs
 import kotlin.math.ln
 import kotlin.math.max
 import kotlin.math.min
+import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.roundToLong
 
@@ -159,12 +165,27 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
     private var pendingRawImage: Image? = null
     private var isCapturingStill: Boolean = false
 
-    // Astro multi-frame burst cancellation flag
+    // Astro & Computational multi-frame burst cancellation flag
     @Volatile
     var isAstroBurstRunning: Boolean = false
 
     @Volatile
     var cancelAstroBurstRequested: Boolean = false
+
+    // Pro Cinema Video Recording state (`MediaRecorder` + dedicated Camera2 record session)
+    private var mediaRecorder: MediaRecorder? = null
+    private var currentVideoTempFile: File? = null
+    private var videoRecordStartMs: Long = 0L
+    private var videoResolutionLabel: String = "1920x1080"
+    private var videoTargetFps: Int = 30
+    private var videoBitrateMbps: Int = 50
+    private var videoStabilizationEnabled: Boolean = true
+
+    @Volatile
+    var isRecordingVideo: Boolean = false
+
+    @Volatile
+    var isVideoPaused: Boolean = false
 
     init {
         setBackgroundColor(0xFF05070A.toInt())
@@ -445,10 +466,32 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
         val texture = textureView.surfaceTexture ?: return
 
         try {
-            val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_PREVIEW)
+            val template = if (isRecordingVideo && mediaRecorder != null) {
+                CameraDevice.TEMPLATE_RECORD
+            } else {
+                CameraDevice.TEMPLATE_PREVIEW
+            }
+            val builder = device.createCaptureRequest(template)
             val previewSurface = Surface(texture)
             builder.addTarget(previewSurface)
             yuvReader?.surface?.let { builder.addTarget(it) }
+
+            if (isRecordingVideo && mediaRecorder != null) {
+                try {
+                    builder.addTarget(mediaRecorder!!.surface)
+                    builder.set(
+                        CaptureRequest.CONTROL_AE_TARGET_FPS_RANGE,
+                        Range(videoTargetFps, videoTargetFps)
+                    )
+                    if (videoStabilizationEnabled) {
+                        builder.set(
+                            CaptureRequest.CONTROL_VIDEO_STABILIZATION_MODE,
+                            CameraMetadata.CONTROL_VIDEO_STABILIZATION_MODE_ON
+                        )
+                    }
+                } catch (_: Throwable) {
+                }
+            }
 
             applyManualControlsToBuilder(builder, isStillCapture = false)
 
@@ -1278,6 +1321,594 @@ class CameraEngineView(context: Context) : FrameLayout(context), TextureView.Sur
         )
         matrix.postScale(scale, scale, centerX, centerY)
         textureView.setTransform(matrix)
+    }
+
+    /**
+     * Starts a high-bitrate Camera2 `TEMPLATE_RECORD` + `MediaRecorder` cinema video session
+     * while preserving real-time manual control over shutter speed (180-degree shutter rule),
+     * ISO gain, manual rack-focus in diopters, and Kelvin white balance.
+     */
+    fun startVideoRecording(
+        resolutionPreset: String,
+        fps: Int,
+        bitrateMbps: Int,
+        enableAudio: Boolean,
+        enableStabilization: Boolean,
+        promise: Promise
+    ) {
+        val handler = cameraHandler
+        if (handler == null) {
+            promise.reject("VIDEO_NOT_READY", "Camera thread is not running.")
+            return
+        }
+
+        handler.post {
+            val device = cameraDevice
+            val chars = activeCharacteristics
+            val texture = textureView.surfaceTexture
+            if (device == null || chars == null || texture == null) {
+                promise.reject("VIDEO_NOT_READY", "Camera2 device is not open.")
+                return@post
+            }
+            if (isRecordingVideo) {
+                promise.reject("VIDEO_BUSY", "Video recording is already active.")
+                return@post
+            }
+
+            try {
+                try {
+                    captureSession?.stopRepeating()
+                    captureSession?.close()
+                } catch (_: Throwable) {
+                }
+                captureSession = null
+
+                val map = chars.get(CameraCharacteristics.SCALER_STREAM_CONFIGURATION_MAP)
+                val videoSizes = map?.getOutputSizes(MediaRecorder::class.java) ?: emptyArray()
+                val desiredWidth = when (resolutionPreset.uppercase(Locale.US)) {
+                    "4K", "UHD", "2160P" -> 3840
+                    "720P", "HD" -> 1280
+                    else -> 1920
+                }
+                val desiredHeight = when (resolutionPreset.uppercase(Locale.US)) {
+                    "4K", "UHD", "2160P" -> 2160
+                    "720P", "HD" -> 720
+                    else -> 1080
+                }
+
+                val chosenVideoSize = videoSizes.firstOrNull {
+                    it.width == desiredWidth && it.height == desiredHeight
+                } ?: videoSizes.filter { it.width <= desiredWidth && it.height <= desiredHeight }
+                    .maxByOrNull { it.width.toLong() * it.height.toLong() }
+                    ?: videoSizes.maxByOrNull { it.width.toLong() * it.height.toLong() }
+                    ?: Size(1920, 1080)
+
+                videoResolutionLabel = "${chosenVideoSize.width}x${chosenVideoSize.height}"
+                videoTargetFps = fps.coerceIn(24, 60)
+                videoBitrateMbps = bitrateMbps.coerceIn(8, 120)
+                videoStabilizationEnabled = enableStabilization
+
+                val outDir = File(context.cacheDir, "cinema_recordings").apply { mkdirs() }
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                val tempVideoFile = File(outDir, "VID_${timestamp}.mp4")
+                currentVideoTempFile = tempVideoFile
+
+                val hasAudioPerm = context.checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
+                    PackageManager.PERMISSION_GRANTED
+                val recordWithAudio = enableAudio && hasAudioPerm
+
+                @Suppress("DEPRECATION")
+                val recorder = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+                    MediaRecorder(context)
+                } else {
+                    MediaRecorder()
+                }
+
+                if (recordWithAudio) {
+                    recorder.setAudioSource(MediaRecorder.AudioSource.MIC)
+                }
+                recorder.setVideoSource(MediaRecorder.VideoSource.SURFACE)
+                recorder.setOutputFormat(MediaRecorder.OutputFormat.MPEG_4)
+                recorder.setOutputFile(tempVideoFile.absolutePath)
+                recorder.setVideoEncodingBitRate(videoBitrateMbps * 1_000_000)
+                recorder.setVideoFrameRate(videoTargetFps)
+                recorder.setVideoSize(chosenVideoSize.width, chosenVideoSize.height)
+                recorder.setVideoEncoder(MediaRecorder.VideoEncoder.H264)
+                if (recordWithAudio) {
+                    recorder.setAudioEncoder(MediaRecorder.AudioEncoder.AAC)
+                    recorder.setAudioEncodingBitRate(192_000)
+                    recorder.setAudioSamplingRate(48_000)
+                }
+
+                val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                recorder.setOrientationHint(sensorOrientation)
+                recorder.prepare()
+
+                mediaRecorder = recorder
+                val recorderSurface = recorder.surface
+
+                texture.setDefaultBufferSize(previewSize.width, previewSize.height)
+                val previewSurface = Surface(texture)
+
+                val surfaces = mutableListOf<Surface>(previewSurface, recorderSurface)
+                yuvReader?.surface?.let { surfaces.add(it) }
+
+                device.createCaptureSession(
+                    surfaces,
+                    object : CameraCaptureSession.StateCallback() {
+                        override fun onConfigured(session: CameraCaptureSession) {
+                            captureSession = session
+                            isRecordingVideo = true
+                            isVideoPaused = false
+                            updateRepeatingPreviewRequest()
+                            try {
+                                recorder.start()
+                                videoRecordStartMs = System.currentTimeMillis()
+                                val resMap = Arguments.createMap().apply {
+                                    putString("resolution", videoResolutionLabel)
+                                    putInt("fps", videoTargetFps)
+                                    putInt("bitrateMbps", videoBitrateMbps)
+                                    putBoolean("audioEnabled", recordWithAudio)
+                                }
+                                promise.resolve(resMap)
+                            } catch (startErr: Throwable) {
+                                isRecordingVideo = false
+                                releaseMediaRecorder()
+                                createPreviewSession(allowRawSurface = true)
+                                promise.reject(
+                                    "VIDEO_START_ERROR",
+                                    "Failed starting MediaRecorder: ${startErr.message}",
+                                    startErr
+                                )
+                            }
+                        }
+
+                        override fun onConfigureFailed(session: CameraCaptureSession) {
+                            isRecordingVideo = false
+                            releaseMediaRecorder()
+                            createPreviewSession(allowRawSurface = true)
+                            promise.reject(
+                                "VIDEO_SESSION_FAILED",
+                                "Camera2 rejected video recording stream configuration ($videoResolutionLabel @ ${videoTargetFps}fps)."
+                            )
+                        }
+                    },
+                    cameraHandler
+                )
+            } catch (e: Throwable) {
+                isRecordingVideo = false
+                releaseMediaRecorder()
+                createPreviewSession(allowRawSurface = true)
+                promise.reject("VIDEO_SETUP_ERROR", "Could not initialize video recorder: ${e.message}", e)
+            }
+        }
+    }
+
+    fun pauseVideoRecording(promise: Promise) {
+        val handler = cameraHandler ?: run {
+            promise.resolve(false)
+            return
+        }
+        handler.post {
+            try {
+                if (isRecordingVideo && !isVideoPaused && mediaRecorder != null) {
+                    mediaRecorder?.pause()
+                    isVideoPaused = true
+                    promise.resolve(true)
+                } else {
+                    promise.resolve(false)
+                }
+            } catch (e: Throwable) {
+                promise.reject("VIDEO_PAUSE_ERROR", "Could not pause recording: ${e.message}", e)
+            }
+        }
+    }
+
+    fun resumeVideoRecording(promise: Promise) {
+        val handler = cameraHandler ?: run {
+            promise.resolve(false)
+            return
+        }
+        handler.post {
+            try {
+                if (isRecordingVideo && isVideoPaused && mediaRecorder != null) {
+                    mediaRecorder?.resume()
+                    isVideoPaused = false
+                    promise.resolve(true)
+                } else {
+                    promise.resolve(false)
+                }
+            } catch (e: Throwable) {
+                promise.reject("VIDEO_RESUME_ERROR", "Could not resume recording: ${e.message}", e)
+            }
+        }
+    }
+
+    fun stopVideoRecording(promise: Promise) {
+        val handler = cameraHandler
+        if (handler == null) {
+            promise.reject("VIDEO_NOT_READY", "Camera thread is not active.")
+            return
+        }
+
+        handler.post {
+            if (!isRecordingVideo || mediaRecorder == null) {
+                promise.reject("VIDEO_NOT_RECORDING", "No active video recording to stop.")
+                return@post
+            }
+
+            val durationSec = ((System.currentTimeMillis() - videoRecordStartMs).coerceAtLeast(100L) / 100.0).roundToInt() / 10.0
+            val tempFile = currentVideoTempFile
+
+            try {
+                try {
+                    captureSession?.stopRepeating()
+                    captureSession?.abortCaptures()
+                } catch (_: Throwable) {
+                }
+                mediaRecorder?.stop()
+            } catch (stopErr: Throwable) {
+                Log.w(TAG, "MediaRecorder stop warning: ${stopErr.message}")
+            } finally {
+                isRecordingVideo = false
+                isVideoPaused = false
+                releaseMediaRecorder()
+            }
+
+            var savedUri: String? = null
+            var fileSizeMb = 0.0
+            if (tempFile != null && tempFile.exists() && tempFile.length() > 0L) {
+                fileSizeMb = ((tempFile.length().toDouble() / (1024.0 * 1024.0)) * 100.0).roundToInt() / 100.0
+                val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                savedUri = saveVideoFileToMediaStore(
+                    sourceFile = tempFile,
+                    displayName = "CINEMA_${timestamp}_${videoResolutionLabel}.mp4"
+                )
+            }
+
+            // Re-establish standard still/preview session
+            createPreviewSession(allowRawSurface = true)
+
+            val result = Arguments.createMap().apply {
+                putString("videoUri", savedUri ?: (tempFile?.let { "file://${it.absolutePath}" } ?: ""))
+                putString("resolution", videoResolutionLabel)
+                putInt("fps", videoTargetFps)
+                putInt("bitrateMbps", videoBitrateMbps)
+                putDouble("durationSec", durationSec)
+                putDouble("fileSizeMb", fileSizeMb)
+                putString("albumPath", "DCIM/NativeCamera")
+            }
+            promise.resolve(result)
+        }
+    }
+
+    private fun releaseMediaRecorder() {
+        try {
+            mediaRecorder?.reset()
+        } catch (_: Throwable) {
+        }
+        try {
+            mediaRecorder?.release()
+        } catch (_: Throwable) {
+        }
+        mediaRecorder = null
+    }
+
+    private fun saveVideoFileToMediaStore(sourceFile: File, displayName: String): String? {
+        return try {
+            val resolver = context.contentResolver
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, "video/mp4")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DCIM}/NativeCamera")
+                    put(MediaStore.MediaColumns.IS_PENDING, 1)
+                }
+            }
+
+            val uri = resolver.insert(MediaStore.Video.Media.EXTERNAL_CONTENT_URI, values) ?: return null
+            resolver.openOutputStream(uri)?.use { out ->
+                FileInputStream(sourceFile).use { input ->
+                    input.copyTo(out, bufferSize = 64 * 1024)
+                }
+                out.flush()
+            }
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                val doneValues = ContentValues().apply {
+                    put(MediaStore.MediaColumns.IS_PENDING, 0)
+                }
+                resolver.update(uri, doneValues, null, null)
+            }
+            uri.toString()
+        } catch (e: Throwable) {
+            Log.e(TAG, "Failed saving MP4 video to MediaStore", e)
+            null
+        }
+    }
+
+    /**
+     * Executes multi-frame computational photography bursts:
+     * - modeCode = 1 (HDR+ Exposure Bracketing): Sweeps exposure time across [-2 EV .. +2 EV]
+     *   around the metered/selected base shutter speed and fuses via Mertens Exposure Fusion.
+     * - modeCode = 2 (Light Trails / Star Trails): Captures continuous long-exposure frames and
+     *   fuses moving highlights with background noise suppression.
+     * - modeCode = 3 (Night Super-Res / Multi-Frame Denoise): Captures handheld burst, aligns
+     *   via C++17 RANSAC keypoints, and applies trimmed-mean + unsharp mask.
+     * - modeCode = 4 (Macro Focus Bracketing): Sweeps lens voice-coil motor in diopters from
+     *   closest macro focus toward infinity and fuses the sharpest focus planes.
+     */
+    fun runComputationalBurstCapture(
+        modeCode: Int,
+        frameCount: Int,
+        baseExposureSec: Double,
+        targetIso: Int,
+        evStep: Double,
+        promise: Promise
+    ) {
+        val handler = cameraHandler
+        if (handler == null) {
+            promise.reject("MODE_NOT_READY", "Camera background thread is not active.")
+            return
+        }
+
+        handler.post {
+            val device = cameraDevice
+            val session = captureSession
+            val chars = activeCharacteristics
+            val jReader = jpegReader
+
+            if (device == null || session == null || chars == null || jReader == null) {
+                promise.reject("MODE_NOT_READY", "Camera2 session is not ready.")
+                return@post
+            }
+            if (isAstroBurstRunning || isRecordingVideo) {
+                promise.reject("MODE_BUSY", "Camera is already busy with another capture.")
+                return@post
+            }
+
+            isAstroBurstRunning = true
+            cancelAstroBurstRequested = false
+
+            val totalFrames = frameCount.coerceIn(3, 25)
+            val stackWidth = 1600
+            val stackHeight = 1200
+
+            AstroStackerNative.beginSession(stackWidth, stackHeight, totalFrames)
+
+            val expRange = chars.get(CameraCharacteristics.SENSOR_INFO_EXPOSURE_TIME_RANGE)
+            val baseExpNs = if (baseExposureSec > 0.0) {
+                (baseExposureSec * 1_000_000_000.0).roundToLong()
+            } else {
+                lastMeteredExposureNs
+            }
+            val isoRange = chars.get(CameraCharacteristics.SENSOR_INFO_SENSITIVITY_RANGE)
+            val baseIso = if (targetIso > 0) targetIso else lastMeteredIso
+            val clampedIso = if (isoRange != null) {
+                baseIso.coerceIn(isoRange.lower, isoRange.upper)
+            } else {
+                baseIso
+            }
+
+            val minFocusDiopters = chars.get(CameraCharacteristics.LENS_INFO_MINIMUM_FOCUS_DISTANCE) ?: 10.0f
+
+            val tempDir = File(context.cacheDir, "comp_modes").apply { mkdirs() }
+            var firstFrameFile: File? = null
+            var progressiveFile: File? = null
+            var capturedFrames = 0
+            var totalIntegrationNs = 0L
+
+            val modePrefix = when (modeCode) {
+                1 -> "HDR_FUSION"
+                2 -> "LIGHT_TRAILS"
+                3 -> "SUPER_RES"
+                4 -> "FOCUS_STACK"
+                else -> "COMP_STACK"
+            }
+
+            fun finalizeModeOutput() {
+                try {
+                    if (capturedFrames <= 0) {
+                        AstroStackerNative.resetSession()
+                        isAstroBurstRunning = false
+                        updateRepeatingPreviewRequest()
+                        promise.reject("MODE_CANCELLED", "Capture cancelled before Frame 1 finished.")
+                        return
+                    }
+
+                    emitAstroProgress(
+                        currentFrame = capturedFrames,
+                        totalFrames = totalFrames,
+                        stage = "STACKING",
+                        message = "Running C++17 $modePrefix fusion across $capturedFrames frames...",
+                        previewUri = progressiveFile?.let { "file://${it.absolutePath}" },
+                        abortedByMotion = false
+                    )
+
+                    val finalPixels = IntArray(stackWidth * stackHeight)
+                    val statsJson = AstroStackerNative.finalizeComputationalMode(modeCode, finalPixels)
+                    val finalBitmap = Bitmap.createBitmap(stackWidth, stackHeight, Bitmap.Config.ARGB_8888)
+                    finalBitmap.setPixels(finalPixels, 0, stackWidth, 0, 0, stackWidth, stackHeight)
+
+                    val outStream = ByteArrayOutputStream()
+                    finalBitmap.compress(Bitmap.CompressFormat.JPEG, 98, outStream)
+                    val finalBytes = outStream.toByteArray()
+
+                    val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+                    val savedMediaUri = saveBytesToMediaStore(
+                        bytes = finalBytes,
+                        displayName = "${modePrefix}_${timestamp}_${capturedFrames}F.jpg",
+                        mimeType = "image/jpeg"
+                    )
+
+                    val finalCacheFile = File(tempDir, "${modePrefix.lowercase(Locale.US)}_${timestamp}.jpg")
+                    FileOutputStream(finalCacheFile).use { it.write(finalBytes) }
+
+                    AstroStackerNative.resetSession()
+                    isAstroBurstRunning = false
+                    updateRepeatingPreviewRequest()
+
+                    val totalSec = ((totalIntegrationNs.toDouble() / 1_000_000_000.0) * 100.0).roundToInt() / 100.0
+                    val response = Arguments.createMap().apply {
+                        putString("stackedUri", "file://${finalCacheFile.absolutePath}")
+                        putString("mediaStoreUri", savedMediaUri ?: "")
+                        putString("singleFrameUri", firstFrameFile?.let { "file://${it.absolutePath}" } ?: "")
+                        putInt("framesStacked", capturedFrames)
+                        putInt("totalRequestedFrames", totalFrames)
+                        putDouble("perFrameExposureSec", (baseExpNs.toDouble() / 1_000_000_000.0 * 100.0).roundToInt() / 100.0)
+                        putDouble("totalIntegrationSec", totalSec)
+                        putInt("iso", clampedIso)
+                        putBoolean("abortedEarlyByMotion", false)
+                        putString("alignmentReportJson", statsJson)
+                        putString("albumPath", "DCIM/NativeCamera")
+                    }
+                    promise.resolve(response)
+                } catch (e: Throwable) {
+                    AstroStackerNative.resetSession()
+                    isAstroBurstRunning = false
+                    updateRepeatingPreviewRequest()
+                    promise.reject("MODE_STACK_ERROR", "Computational mode failed: ${e.message}", e)
+                }
+            }
+
+            fun captureNextModeFrame(frameIndex: Int) {
+                if (cancelAstroBurstRequested || frameIndex >= totalFrames) {
+                    finalizeModeOutput()
+                    return
+                }
+
+                // Compute per-frame exposure or focus bracket target
+                val midIdx = (totalFrames - 1) / 2.0
+                val evOffset = if (modeCode == 1) {
+                    (frameIndex - midIdx) * evStep.coerceIn(0.5, 2.0)
+                } else {
+                    0.0
+                }
+                val frameExpRawNs = (baseExpNs.toDouble() * 2.0.pow(evOffset)).roundToLong()
+                val frameExpNs = if (expRange != null) {
+                    frameExpRawNs.coerceIn(expRange.lower, expRange.upper)
+                } else {
+                    frameExpRawNs.coerceAtLeast(100_000L)
+                }
+
+                val frameFocusDiopters = if (modeCode == 4 && minFocusDiopters > 0.1f) {
+                    // Sweep from close macro (85% of minFocusDistance) down to 0.0f (infinity)
+                    val ratio = 1.0f - (frameIndex.toFloat() / max(1, totalFrames - 1).toFloat())
+                    (minFocusDiopters * 0.85f * ratio).coerceIn(0.0f, minFocusDiopters)
+                } else {
+                    focusDistanceDiopters
+                }
+
+                val frameDesc = when (modeCode) {
+                    1 -> "EV ${if (evOffset >= 0) "+" else ""}${(evOffset * 10.0).roundToInt() / 10.0} (${formatShutterSpeedNs(frameExpNs)})"
+                    4 -> "Focus ${(frameFocusDiopters * 10.0f).roundToInt() / 10.0} D"
+                    else -> "${formatShutterSpeedNs(frameExpNs)} @ ISO $clampedIso"
+                }
+
+                emitAstroProgress(
+                    currentFrame = frameIndex + 1,
+                    totalFrames = totalFrames,
+                    stage = "CAPTURING",
+                    message = "$modePrefix Frame ${frameIndex + 1}/$totalFrames • $frameDesc",
+                    previewUri = progressiveFile?.let { "file://${it.absolutePath}" },
+                    abortedByMotion = false
+                )
+
+                jReader.setOnImageAvailableListener({ reader ->
+                    val img = reader.acquireLatestImage() ?: return@setOnImageAvailableListener
+                    try {
+                        val buffer = img.planes[0].buffer
+                        val bytes = ByteArray(buffer.remaining())
+                        buffer.get(bytes)
+
+                        val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+                        if (decoded != null) {
+                            val scaled = Bitmap.createScaledBitmap(decoded, stackWidth, stackHeight, true)
+                            if (scaled !== decoded) decoded.recycle()
+
+                            if (frameIndex == 0) {
+                                val f1 = File(tempDir, "comp_ref_${System.currentTimeMillis()}.jpg")
+                                FileOutputStream(f1).use { out ->
+                                    scaled.compress(Bitmap.CompressFormat.JPEG, 92, out)
+                                }
+                                firstFrameFile = f1
+                            }
+
+                            val frameArgb = IntArray(stackWidth * stackHeight)
+                            scaled.getPixels(frameArgb, 0, stackWidth, 0, 0, stackWidth, stackHeight)
+
+                            val previewArgb = IntArray(stackWidth * stackHeight)
+                            val infoText = if (modeCode == 3) {
+                                AstroStackerNative.addFrameAndGetPreview(frameArgb, frameIndex, previewArgb)
+                            } else {
+                                AstroStackerNative.addUnalignedFrameAndGetPreview(
+                                    frameArgb,
+                                    frameIndex,
+                                    modeCode,
+                                    previewArgb
+                                )
+                            }
+
+                            capturedFrames = frameIndex + 1
+                            totalIntegrationNs += frameExpNs
+
+                            val progBitmap = Bitmap.createBitmap(stackWidth, stackHeight, Bitmap.Config.ARGB_8888)
+                            progBitmap.setPixels(previewArgb, 0, stackWidth, 0, 0, stackWidth, stackHeight)
+                            val pFile = File(tempDir, "comp_prog_${frameIndex + 1}.jpg")
+                            FileOutputStream(pFile).use { out ->
+                                progBitmap.compress(Bitmap.CompressFormat.JPEG, 88, out)
+                            }
+                            progBitmap.recycle()
+                            scaled.recycle()
+                            progressiveFile = pFile
+
+                            emitAstroProgress(
+                                currentFrame = capturedFrames,
+                                totalFrames = totalFrames,
+                                stage = "ALIGNED",
+                                message = "$infoText • $frameDesc",
+                                previewUri = "file://${pFile.absolutePath}",
+                                abortedByMotion = false
+                            )
+                        }
+                    } catch (e: Throwable) {
+                        Log.e(TAG, "Error processing computational frame $frameIndex", e)
+                    } finally {
+                        img.close()
+                        captureNextModeFrame(frameIndex + 1)
+                    }
+                }, cameraHandler)
+
+                try {
+                    val builder = device.createCaptureRequest(CameraDevice.TEMPLATE_STILL_CAPTURE)
+                    builder.addTarget(jReader.surface)
+                    textureView.surfaceTexture?.let { builder.addTarget(Surface(it)) }
+
+                    builder.set(CaptureRequest.CONTROL_AE_MODE, CameraMetadata.CONTROL_AE_MODE_OFF)
+                    builder.set(CaptureRequest.SENSOR_EXPOSURE_TIME, frameExpNs)
+                    builder.set(CaptureRequest.SENSOR_SENSITIVITY, clampedIso)
+
+                    if (modeCode == 4 && minFocusDiopters > 0.0f) {
+                        builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, frameFocusDiopters)
+                    } else if (manualFocus && minFocusDiopters > 0.0f) {
+                        builder.set(CaptureRequest.CONTROL_AF_MODE, CameraMetadata.CONTROL_AF_MODE_OFF)
+                        builder.set(CaptureRequest.LENS_FOCUS_DISTANCE, focusDistanceDiopters)
+                    }
+
+                    val sensorOrientation = chars.get(CameraCharacteristics.SENSOR_ORIENTATION) ?: 90
+                    builder.set(CaptureRequest.JPEG_ORIENTATION, sensorOrientation)
+                    builder.set(CaptureRequest.JPEG_QUALITY, 96.toByte())
+
+                    session.capture(builder.build(), null, cameraHandler)
+                } catch (e: Throwable) {
+                    Log.e(TAG, "Error submitting computational frame request", e)
+                    finalizeModeOutput()
+                }
+            }
+
+            captureNextModeFrame(0)
+        }
     }
 
     private fun closeCameraInternal() {

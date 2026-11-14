@@ -3,10 +3,12 @@ import { Tabs } from 'expo-router';
 import { StatusBar } from 'expo-status-bar';
 import { Ionicons, MaterialCommunityIcons } from '@expo/vector-icons';
 
-// Root navigator for our three core photography pillars:
+// Root navigator for our five core photography & cinematography pillars:
 // 1. Sensor Info (Deep Hardware & Camera2 Characteristics Inspector)
 // 2. Pro Mode (Manual Exposure, ISO, Diopter Focus, Kelvin WB, Live Histogram & RAW DNG)
-// 3. Astro Mode (Multi-frame Star Alignment, Sigma-Clipped Stacking & Tripod Gyro Guard)
+// 3. Record (Cinema Video Recorder with 180-degree shutter lock, Rack Focus A/B, 4K/60fps/80Mbps)
+// 4. Lab Modes (C++17 HDR+ Exposure Fusion, Light Trails, Night Super-Res & Macro Focus Stack)
+// 5. Astro Mode (Multi-frame Star Alignment, Sigma-Clipped Stacking & Tripod Gyro Guard)
 export default function RootLayout() {
   return (
     <>
@@ -25,36 +27,54 @@ export default function RootLayout() {
           tabBarActiveTintColor: '#F59E0B',
           tabBarInactiveTintColor: '#64748B',
           tabBarLabelStyle: {
-            fontSize: 11,
+            fontSize: 10,
             fontWeight: '700',
-            letterSpacing: 0.4,
+            letterSpacing: 0.3,
           },
         }}
       >
         <Tabs.Screen
           name="index"
           options={{
-            title: 'Sensor Info',
+            title: 'Sensors',
             tabBarIcon: ({ color, size }) => (
-              <MaterialCommunityIcons name="chip" size={size} color={String(color)} />
+              <MaterialCommunityIcons name="chip" size={size - 2} color={String(color)} />
             ),
           }}
         />
         <Tabs.Screen
           name="pro"
           options={{
-            title: 'Pro Mode',
+            title: 'Pro RAW',
             tabBarIcon: ({ color, size }) => (
-              <Ionicons name="aperture-outline" size={size} color={String(color)} />
+              <Ionicons name="aperture-outline" size={size - 2} color={String(color)} />
+            ),
+          }}
+        />
+        <Tabs.Screen
+          name="video"
+          options={{
+            title: 'Record',
+            tabBarIcon: ({ color, size }) => (
+              <Ionicons name="videocam-outline" size={size - 2} color={String(color)} />
+            ),
+          }}
+        />
+        <Tabs.Screen
+          name="modes"
+          options={{
+            title: 'Lab Modes',
+            tabBarIcon: ({ color, size }) => (
+              <Ionicons name="layers-outline" size={size - 2} color={String(color)} />
             ),
           }}
         />
         <Tabs.Screen
           name="astro"
           options={{
-            title: 'Astro Mode',
+            title: 'Astro',
             tabBarIcon: ({ color, size }) => (
-              <Ionicons name="sparkles-outline" size={size} color={String(color)} />
+              <Ionicons name="sparkles-outline" size={size - 2} color={String(color)} />
             ),
           }}
         />

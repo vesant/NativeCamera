@@ -133,6 +133,84 @@ class CameraEngineModule(private val reactContext: ReactApplicationContext) :
     }
 
     @ReactMethod
+    fun startVideoRecording(
+        resolutionPreset: String,
+        fps: Int,
+        bitrateMbps: Int,
+        enableAudio: Boolean,
+        enableStabilization: Boolean,
+        promise: Promise
+    ) {
+        val view = CameraEngineView.activeInstance
+        if (view == null) {
+            promise.reject("NO_ACTIVE_VIEW", "CameraEngineView is not mounted.")
+            return
+        }
+        view.startVideoRecording(
+            resolutionPreset = resolutionPreset,
+            fps = fps,
+            bitrateMbps = bitrateMbps,
+            enableAudio = enableAudio,
+            enableStabilization = enableStabilization,
+            promise = promise
+        )
+    }
+
+    @ReactMethod
+    fun pauseVideoRecording(promise: Promise) {
+        val view = CameraEngineView.activeInstance
+        if (view == null) {
+            promise.resolve(false)
+            return
+        }
+        view.pauseVideoRecording(promise)
+    }
+
+    @ReactMethod
+    fun resumeVideoRecording(promise: Promise) {
+        val view = CameraEngineView.activeInstance
+        if (view == null) {
+            promise.resolve(false)
+            return
+        }
+        view.resumeVideoRecording(promise)
+    }
+
+    @ReactMethod
+    fun stopVideoRecording(promise: Promise) {
+        val view = CameraEngineView.activeInstance
+        if (view == null) {
+            promise.reject("NO_ACTIVE_VIEW", "CameraEngineView is not mounted.")
+            return
+        }
+        view.stopVideoRecording(promise)
+    }
+
+    @ReactMethod
+    fun startComputationalCapture(
+        modeCode: Int,
+        frameCount: Int,
+        baseExposureSec: Double,
+        iso: Int,
+        evStep: Double,
+        promise: Promise
+    ) {
+        val view = CameraEngineView.activeInstance
+        if (view == null) {
+            promise.reject("NO_ACTIVE_VIEW", "CameraEngineView is not mounted.")
+            return
+        }
+        view.runComputationalBurstCapture(
+            modeCode = modeCode,
+            frameCount = frameCount,
+            baseExposureSec = baseExposureSec,
+            targetIso = iso,
+            evStep = evStep,
+            promise = promise
+        )
+    }
+
+    @ReactMethod
     fun addListener(eventName: String) {
         // Required for React Native NativeEventEmitter compatibility
     }
