@@ -17,13 +17,16 @@ import expo.modules.ExpoReactHostFactory
 class MainApplication : Application(), ReactApplication {
 
   override val reactHost: ReactHost by lazy {
+    val otaBundlePath = GitUpdaterModule.resolveStartupBundlePath(applicationContext)
     ExpoReactHostFactory.getDefaultReactHost(
       context = applicationContext,
       packageList =
         PackageList(this).packages.apply {
-          // Register our low-level Camera2 inspector, manual control engine, and astro stacker.
+          // Register our low-level Camera2 inspector, manual control engine, astro stacker, and Git OTA updater.
           add(NativeCameraPackage())
-        }
+        },
+      jsBundleFilePath = otaBundlePath,
+      useDevSupport = false
     )
   }
 

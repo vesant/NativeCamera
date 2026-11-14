@@ -18,6 +18,7 @@ import {
   CameraSensorCharacteristics,
   inspectDeviceCameras,
 } from '@/native/CameraInspector';
+import { GitUpdaterHeaderButton } from '@/components/GitUpdaterBanner';
 
 export default function SensorInfoScreen() {
   const [report, setReport] = useState<CameraInspectionReport | null>(null);
@@ -93,10 +94,13 @@ export default function SensorInfoScreen() {
             <Text style={styles.brandTag}>NATIVECAMERA // HARDWARE LAB</Text>
             <Text style={styles.headerTitle}>Camera2 & CMOS Inspector</Text>
           </View>
-          <Pressable style={styles.refreshBtn} onPress={loadHardwareReport}>
-            <Ionicons name="refresh" size={18} color="#F59E0B" />
-            <Text style={styles.refreshBtnText}>Rescan</Text>
-          </Pressable>
+          <View style={{ flexDirection: 'row', alignItems: 'center', gap: 8 }}>
+            <GitUpdaterHeaderButton />
+            <Pressable style={styles.refreshBtn} onPress={loadHardwareReport}>
+              <Ionicons name="refresh" size={18} color="#F59E0B" />
+              <Text style={styles.refreshBtnText}>Rescan</Text>
+            </Pressable>
+          </View>
         </View>
 
         {report && (

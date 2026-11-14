@@ -1,0 +1,59 @@
+name: Android Git OTA & APK Release
+
+on:
+  push:
+    branches:
+      - main
+    paths-ignore:
+      - 'ota/**'
+      - 'README.md'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-ota-and-apk:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Set up Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build Android APK (arm64-v8a)
+        working-directory: android
+        run: ./gradlew assembleDebug -PreactNativeArchitectures=arm64-v8a
+
+      - name: Publish Latest APK to GitHub Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: Latest NativeCamera Android Build
+          body: Automated Android APK & Hermes OTA build from commit ${{ github.sha }}
+          files: |
+            android/app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Update ota/manifest.json & ota/index.android.bundle
+        run: |
+          chmod +x scripts/publish-git-ota.sh
+          ./scripts/publish-git-ota.sh "${GITHUB_SHA::7}" "$(git log -1 --pretty=%s)"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ota/index.android.bundle ota/manifest.json
+          git diff --staged --quiet || (git commit -m "chore(ota): update Hermes OTA bundle for ${GITHUB_SHA::7} [skip ci]" && git push origin HEAD:main)

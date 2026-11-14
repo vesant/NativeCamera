@@ -14,7 +14,8 @@ class NativeCameraPackage : ReactPackage {
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
         return listOf(
             CameraInspectorModule(reactContext),
-            CameraEngineModule(reactContext)
+            CameraEngineModule(reactContext),
+            GitUpdaterModule(reactContext)
         )
     }
 

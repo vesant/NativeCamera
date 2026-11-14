@@ -85,6 +85,22 @@ Implemented in [`MediaPreviewModal.tsx`](src/components/MediaPreviewModal.tsx) a
 
 ---
 
+### Pillar F: GitHub Over-The-Air (OTA) & APK Self-Updater (No USB Debugging Needed)
+Implemented natively in [`GitUpdaterModule.kt`](android/app/src/main/java/com/vesant/nativecamera/GitUpdaterModule.kt), [`MainApplication.kt`](android/app/src/main/java/com/vesant/nativecamera/MainApplication.kt), and [`GitUpdaterBanner.tsx`](src/components/GitUpdaterBanner.tsx):
+- **Automatic GitHub Repository Polling:** On launch (and via the top **Git Sync** button in `Sensor Info`), the app queries `https://raw.githubusercontent.com/vesant/NativeCamera/main/ota/manifest.json` and the GitHub Commits API (`https://api.github.com/repos/vesant/NativeCamera/commits?sha=main`) to detect when new commits are pushed.
+- **Instant Hermes Bytecode Hot-Swap (`ota/index.android.bundle`):** Downloads the 2.4 MB Hermes bytecode bundle directly from GitHub, verifies its `SHA-256` checksum, writes it to `filesDir/git_ota/index.android.bundle`, and restarts the app process so `ExpoReactHostFactory` boots into the latest code in ~1 second without needing a USB cable.
+- **Crash-Safe Boot Guard & One-Tap Rollback:** Tracks boot health in `SharedPreferences`; if an OTA bundle ever fails twice on startup, `MainApplication` automatically falls back to the built-in APK bundle.
+- **Full APK Self-Updater (`FileProvider`):** Also supports downloading full `.apk` releases from GitHub Releases and launching Android's native package installer.
+- **Publishing Updates from Linux (`npm run ota:publish`):**
+  ```bash
+  npm run ota:publish
+  git add ota/index.android.bundle ota/manifest.json
+  git commit -m "chore(ota): publish latest Hermes OTA bundle"
+  git push origin main
+  ```
+
+---
+
 ## Building from Fedora Linux / Bazzite
 
 ### 1. Prerequisites
@@ -104,7 +120,7 @@ Ensure `ANDROID_HOME` (`~/Android/Sdk`) has the required SDK & NDK packages inst
 sdkmanager "platform-tools" "platforms;android-34" "platforms;android-36" "build-tools;34.0.0" "build-tools;36.0.0" "ndk;26.1.10909125" "cmake;3.22.1"
 ```
 
-### 2. Enable USB Debugging on Your Android Phone
+### 2. Enable USB Debugging on Your Android Phone (First-Time Install Only)
 1. Open **Settings → About Phone** and tap **Build Number** 7 times to unlock Developer Options.
 2. Open **Settings → System → Developer Options** and enable **USB Debugging**.
 3. Connect the phone via USB, select **Allow** on the RSA fingerprint prompt, and verify connection:
@@ -120,3 +136,4 @@ cd android
 ./gradlew assembleDebug
 adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
+After the initial install, future updates can be pulled directly inside the app via the **GitHub OTA & Self-Updater** button without connecting USB.

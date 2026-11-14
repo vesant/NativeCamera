@@ -1,0 +1,13 @@
+{
+  "schemaVersion": 1,
+  "repository": "https://github.com/vesant/NativeCamera",
+  "branch": "main",
+  "commitSha": "1ac8e39",
+  "commitMessage": "feat(ota): implement GitHub OTA Hermes bundle hot-swap and APK self-updater",
+  "author": "Vicente",
+  "publishedAt": "2026-11-14T16:12:20Z",
+  "bundleUrl": "https://raw.githubusercontent.com/vesant/NativeCamera/main/ota/index.android.bundle",
+  "bundleSha256": "d8bb884bb224f5de08efcbcaecbe0e6a3fc575b697741c47762c2438164b9235",
+  "bundleSizeBytes": 2991887,
+  "apkUrl": "https://github.com/vesant/NativeCamera/releases/latest/download/NativeCamera-arm64.apk"
+}
