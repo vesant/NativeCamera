@@ -10,13 +10,17 @@ import com.facebook.react.uimanager.ViewManager
  * surface managers with the React Native bridge.
  */
 class NativeCameraPackage : ReactPackage {
+    @Suppress("DEPRECATION")
     override fun createNativeModules(reactContext: ReactApplicationContext): List<NativeModule> {
         return listOf(
-            CameraInspectorModule(reactContext)
+            CameraInspectorModule(reactContext),
+            CameraEngineModule(reactContext)
         )
     }
 
     override fun createViewManagers(reactContext: ReactApplicationContext): List<ViewManager<*, *>> {
-        return emptyList()
+        return listOf(
+            CameraEngineViewManager()
+        )
     }
 }
